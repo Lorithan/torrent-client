@@ -1,0 +1,193 @@
+package download
+
+import (
+	"bytes"
+	"crypto/sha1"
+	"encoding/binary"
+	"errors"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/lorithan/torrent-client/internal/peer"
+	"github.com/lorithan/torrent-client/internal/torrent"
+)
+
+func downloadFixture(t *testing.T, pieceLength, fileLength, corruptIndex int) (*peer.Client, *torrent.TorrentFile, *pieceTestConn, []byte) {
+	t.Helper()
+	data := make([]byte, fileLength)
+	for i := range data {
+		data[i] = byte(i*31 + i/pieceLength)
+	}
+	tf := &torrent.TorrentFile{Length: int64(fileLength), PieceLength: int64(pieceLength)}
+	var replies []byte
+	for start, index := 0, 0; start < len(data); index++ {
+		piece := data[start:min(start+pieceLength, len(data))]
+		tf.Pieces = append(tf.Pieces, sha1.Sum(piece))
+		for begin := 0; begin < len(piece); {
+			length := min(16384, len(piece)-begin)
+			replies = binary.BigEndian.AppendUint32(replies, uint32(9+length))
+			replies = append(replies, byte(peer.MsgPiece))
+			replies = binary.BigEndian.AppendUint32(replies, uint32(index))
+			replies = binary.BigEndian.AppendUint32(replies, uint32(begin))
+			block := append([]byte(nil), piece[begin:begin+length]...)
+			if index == corruptIndex {
+				block[0] ^= 0xff
+			}
+			replies = append(replies, block...)
+			begin += length
+		}
+		start += len(piece)
+	}
+	conn := &pieceTestConn{incoming: bytes.NewReader(replies)}
+	client, err := peer.NewClient(conn, peer.Handshake{}, len(tf.Pieces))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Choked = false
+	for index := range tf.Pieces {
+		if err := client.Bitfield.SetPiece(index); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return client, tf, conn, data
+}
+
+func TestDownloadWritesCompleteFile(t *testing.T) {
+	client, tf, conn, want := downloadFixture(t, 20000, 45001, -1)
+	f, err := os.Create(filepath.Join(t.TempDir(), "output.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	if err := Download(client, tf, f); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	if _, err := f.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("output differs from torrent contents")
+	}
+	stat, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stat.Size() != tf.Length {
+		t.Errorf("file size = %d, want %d", stat.Size(), tf.Length)
+	}
+	if conn.incoming.Len() != 0 {
+		t.Error("download left piece data unread")
+	}
+}
+
+type downloadWrite struct {
+	offset int64
+	data   []byte
+}
+type downloadTestWriter struct {
+	writes []downloadWrite
+	failAt int
+	err    error
+}
+
+func (w *downloadTestWriter) WriteAt(p []byte, offset int64) (int, error) {
+	w.writes = append(w.writes, downloadWrite{offset, append([]byte(nil), p...)})
+	if len(w.writes) == w.failAt {
+		return len(p) / 2, w.err
+	}
+	return len(p), nil
+}
+
+func TestDownloadDoesNotWriteCorruptedPiece(t *testing.T) {
+	client, tf, conn, data := downloadFixture(t, 4, 10, 1)
+	dst := &downloadTestWriter{}
+	if err := Download(client, tf, dst); err == nil {
+		t.Fatal("accepted corrupted piece")
+	}
+	if len(dst.writes) != 1 {
+		t.Fatalf("writes = %d, want only the first verified piece", len(dst.writes))
+	}
+	if dst.writes[0].offset != 0 || !bytes.Equal(dst.writes[0].data, data[:4]) {
+		t.Error("first verified piece was written incorrectly")
+	}
+	if conn.outgoing.Len() != 34 {
+		t.Errorf("sent %d request bytes, want two requests (34)", conn.outgoing.Len())
+	}
+}
+
+func TestDownloadStopsOnWriteError(t *testing.T) {
+	for _, wantErr := range []error{errors.New("disk full"), io.ErrShortWrite} {
+		t.Run(wantErr.Error(), func(t *testing.T) {
+			client, tf, conn, _ := downloadFixture(t, 4, 10, -1)
+			dst := &downloadTestWriter{failAt: 2, err: wantErr}
+			err := Download(client, tf, dst)
+			if !errors.Is(err, wantErr) {
+				t.Errorf("error = %v, want %v", err, wantErr)
+			}
+			if len(dst.writes) != 2 || dst.writes[1].offset != 4 {
+				t.Errorf("incorrect writes: %+v", dst.writes)
+			}
+			if conn.outgoing.Len() != 34 {
+				t.Error("download continued requesting after write failure")
+			}
+		})
+	}
+}
+
+func TestDownloadDoesNotWriteAfterConnectionFailure(t *testing.T) {
+	client, tf, conn, _ := downloadFixture(t, 4, 10, -1)
+	conn.incoming = bytes.NewReader(nil)
+	dst := &downloadTestWriter{}
+	if err := Download(client, tf, dst); !errors.Is(err, io.EOF) {
+		t.Errorf("error = %v, want EOF", err)
+	}
+	if len(dst.writes) != 0 {
+		t.Error("wrote data after failed first piece")
+	}
+}
+
+func TestDownloadRejectsInvalidMetadataBeforeIO(t *testing.T) {
+	for _, tt := range []struct {
+		name                string
+		length, pieceLength int64
+		hashes              int
+	}{
+		{"zero piece length", 10, 0, 1},
+		{"negative piece length", 10, -4, 1},
+		{"negative file length", -1, 4, 0},
+		{"missing final hash", 10, 4, 2},
+		{"extra hash", 10, 4, 4},
+		{"no hashes for nonempty file", 10, 4, 0},
+		{"extra hash at exact boundary", 8, 4, 3},
+		{"hash for empty file", 0, 4, 1},
+		{"large length count", math.MaxInt64, 2, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			conn := &pieceTestConn{incoming: bytes.NewReader(nil)}
+			client := &peer.Client{Conn: conn}
+			tf := &torrent.TorrentFile{Length: tt.length, PieceLength: tt.pieceLength, Pieces: make([][20]byte, tt.hashes)}
+			dst := &downloadTestWriter{}
+			if err := Download(client, tf, dst); err == nil {
+				t.Fatal("accepted invalid metadata")
+			}
+			if conn.outgoing.Len() != 0 || len(dst.writes) != 0 {
+				t.Error("invalid metadata performed network or output writes")
+			}
+			// A nil client and destination also prove validation doesn't access them.
+			if err := Download(nil, tf, nil); err == nil {
+				t.Error("accepted invalid metadata without dependencies")
+			}
+		})
+	}
+}
+
+func TestDownloadEmptyFile(t *testing.T) {
+	tf := &torrent.TorrentFile{Length: 0, PieceLength: 16384}
+	if err := Download(nil, tf, nil); err != nil {
+		t.Errorf("empty download should succeed without I/O: %v", err)
+	}
+}
