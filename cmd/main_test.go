@@ -140,6 +140,19 @@ func runDownloadScenario(t *testing.T, scenario string) {
 				return
 			}
 		}
+		if scenario == "success" {
+			var have [9]byte
+			if _, err := io.ReadFull(conn, have[:]); err != nil {
+				result.err = fmt.Errorf("reading completion announcement: %w", err)
+				peerDone <- result
+				return
+			}
+			if !bytes.Equal(have[:], []byte{0, 0, 0, 5, 4, 0, 0, 0, 0}) {
+				result.err = fmt.Errorf("incorrect have message: %x", have)
+				peerDone <- result
+				return
+			}
+		}
 		var next [1]byte
 		if _, err := conn.Read(next[:]); err != io.EOF {
 			result.err = fmt.Errorf("expected CLI to close peer connection, got %v", err)

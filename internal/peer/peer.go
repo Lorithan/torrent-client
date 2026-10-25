@@ -2,6 +2,7 @@ package peer
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"time"
 )
@@ -49,6 +50,8 @@ func (c *Client) HandleMessage(m *Message) error {
 		return nil
 	}
 
+	log.Printf("msg id: %d, payload length: %d", m.ID, len(m.Payload))
+
 	switch m.ID {
 	case MsgChoke:
 		if len(m.Payload) != 0 {
@@ -60,12 +63,15 @@ func (c *Client) HandleMessage(m *Message) error {
 			return fmt.Errorf("unchoke message must have an empty payload")
 		}
 		c.Choked = false
+
+		log.Printf("has piece 0: %v", c.Bitfield.HasPiece(0))
 	case MsgHave:
 		index, err := m.HaveIndex(c.PieceCount)
 		if err != nil {
 			return err
 		}
 
+		log.Printf("has piece %d", index)
 		return c.Bitfield.SetPiece(index)
 	case MsgBitfield:
 		bitfield := Bitfield(m.Payload)
@@ -76,6 +82,7 @@ func (c *Client) HandleMessage(m *Message) error {
 		}
 
 		copy(c.Bitfield, bitfield)
+		log.Printf("has piece 0: %v", c.Bitfield.HasPiece(0))
 	}
 
 	return nil
@@ -110,6 +117,26 @@ func (c *Client) WaitForUnchoke() error {
 	return nil
 }
 
+func (c *Client) WaitForPiece(index int) error {
+	if index >= c.PieceCount {
+		return fmt.Errorf("index out of bounds")
+	}
+
+	for c.Choked || !c.Bitfield.HasPiece(index) {
+		message, err := ReadMessage(c.Conn)
+		if err != nil {
+			return err
+		}
+
+		err = c.HandleMessage(message)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (c *Client) DownloadBlock(index, begin, length uint32) ([]byte, error) {
 	if c.Choked {
 		return nil, fmt.Errorf("client is currently chocked")
@@ -125,6 +152,11 @@ func (c *Client) DownloadBlock(index, begin, length uint32) ([]byte, error) {
 	}
 
 	request, err := NewRequest(index, begin, length)
+	if err != nil {
+		return nil, err
+	}
+
+	err = c.Conn.SetDeadline(time.Now().Add(30 * time.Second))
 	if err != nil {
 		return nil, err
 	}
@@ -170,6 +202,11 @@ func (c *Client) DownloadBlock(index, begin, length uint32) ([]byte, error) {
 		}
 		if len(pieceBlock.Data) != int(length) {
 			return nil, fmt.Errorf("recieved block length does not match sent length. Senc %d, recieve %d", length, len(pieceBlock.Data))
+		}
+
+		err = c.Conn.SetDeadline(time.Time{})
+		if err != nil {
+			return nil, err
 		}
 
 		return pieceBlock.Data, nil

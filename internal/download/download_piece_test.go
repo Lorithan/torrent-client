@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lorithan/torrent-client/internal/peer"
 	"github.com/lorithan/torrent-client/internal/torrent"
@@ -17,6 +18,8 @@ type pieceTestConn struct {
 	incoming *bytes.Reader
 	outgoing bytes.Buffer
 }
+
+func (c *pieceTestConn) SetDeadline(time.Time) error { return nil }
 
 func TestDownloadPieceRejectsCorruptedData(t *testing.T) {
 	for _, tt := range []struct {

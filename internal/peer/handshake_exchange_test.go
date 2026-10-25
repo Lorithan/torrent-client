@@ -76,6 +76,8 @@ type exchangeTestConn struct {
 	reads  int
 }
 
+func (c *exchangeTestConn) SetDeadline(time.Time) error { return nil }
+
 func (c *exchangeTestConn) Read(p []byte) (int, error)  { c.reads++; return c.reader.Read(p) }
 func (c *exchangeTestConn) Write(p []byte) (int, error) { return c.writer.Write(p) }
 func (c *exchangeTestConn) Close() error                { c.closed = true; return nil }

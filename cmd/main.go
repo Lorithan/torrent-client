@@ -120,10 +120,6 @@ func run() error {
 	}
 	defer file.Close()
 
-	err = client.Conn.SetDeadline(time.Now().Add(5 * time.Minute))
-	if err != nil {
-		return err
-	}
 	err = download.Download(client, torrentData, file)
 	if err != nil {
 		return err

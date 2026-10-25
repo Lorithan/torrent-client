@@ -39,6 +39,16 @@ func PieceSize(tf *torrent.TorrentFile, index int) (int64, error) {
 	return min(remaining, tf.PieceLength), nil
 }
 
+func SelectPiece(available, completed peer.Bitfield, pieceCount int) (int, bool) {
+	for index := range pieceCount {
+		if available.HasPiece(index) && !completed.HasPiece(index) {
+			return index, true
+		}
+	}
+
+	return 0, false
+}
+
 func DownloadPiece(client *peer.Client, tf *torrent.TorrentFile, index int) ([]byte, error) {
 	pieceSize, err := PieceSize(tf, index)
 	if err != nil {
@@ -47,6 +57,11 @@ func DownloadPiece(client *peer.Client, tf *torrent.TorrentFile, index int) ([]b
 
 	if index > math.MaxUint32 {
 		return nil, fmt.Errorf("index out of range")
+	}
+
+	err = client.WaitForPiece(index)
+	if err != nil {
+		return nil, err
 	}
 
 	piece := make([]byte, 0, pieceSize)

@@ -45,6 +45,17 @@ func NewRequest(index uint32, begin uint32, length uint32) (*Message, error) {
 	}, nil
 }
 
+func NewHave(index uint32) Message {
+	payload := make([]byte, 0, 4)
+
+	payload = binary.BigEndian.AppendUint32(payload, index)
+
+	return Message{
+		ID:      MsgHave,
+		Payload: payload,
+	}
+}
+
 func (m Message) Serialize() []byte {
 	serialize := make([]byte, 4, len(m.Payload)+5)
 

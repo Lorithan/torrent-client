@@ -88,6 +88,31 @@ type downloadWrite struct {
 	offset int64
 	data   []byte
 }
+
+type completionTestWriterFunc func([]byte, int64) (int, error)
+
+func (f completionTestWriterFunc) WriteAt(p []byte, offset int64) (int, error) { return f(p, offset) }
+
+func TestDownloadDoesNotAnnounceBeforeWrite(t *testing.T) {
+	client, tf, conn, _ := downloadFixture(t, 4, 10, -1)
+	wantErr := errors.New("disk full")
+	calls := 0
+	dst := completionTestWriterFunc(func(p []byte, offset int64) (int, error) {
+		calls++
+		// Only the first block request may have been sent before this write.
+		if conn.outgoing.Len() != 17 {
+			t.Errorf("sent %d bytes before writing piece; want only one request (17), with no have", conn.outgoing.Len())
+		}
+		return 0, wantErr
+	})
+	if err := Download(client, tf, dst); !errors.Is(err, wantErr) {
+		t.Errorf("error = %v, want write error", err)
+	}
+	if calls != 1 || conn.outgoing.Len() != 17 {
+		t.Errorf("writes = %d, sent bytes = %d; a failed write must not announce completion", calls, conn.outgoing.Len())
+	}
+}
+
 type downloadTestWriter struct {
 	writes []downloadWrite
 	failAt int
@@ -114,8 +139,8 @@ func TestDownloadDoesNotWriteCorruptedPiece(t *testing.T) {
 	if dst.writes[0].offset != 0 || !bytes.Equal(dst.writes[0].data, data[:4]) {
 		t.Error("first verified piece was written incorrectly")
 	}
-	if conn.outgoing.Len() != 34 {
-		t.Errorf("sent %d request bytes, want two requests (34)", conn.outgoing.Len())
+	if conn.outgoing.Len() != 43 {
+		t.Errorf("sent %d bytes, want two requests and one verified-piece have (43)", conn.outgoing.Len())
 	}
 }
 
@@ -131,7 +156,7 @@ func TestDownloadStopsOnWriteError(t *testing.T) {
 			if len(dst.writes) != 2 || dst.writes[1].offset != 4 {
 				t.Errorf("incorrect writes: %+v", dst.writes)
 			}
-			if conn.outgoing.Len() != 34 {
+			if conn.outgoing.Len() != 43 {
 				t.Error("download continued requesting after write failure")
 			}
 		})
@@ -189,5 +214,54 @@ func TestDownloadEmptyFile(t *testing.T) {
 	tf := &torrent.TorrentFile{Length: 0, PieceLength: 16384}
 	if err := Download(nil, tf, nil); err != nil {
 		t.Errorf("empty download should succeed without I/O: %v", err)
+	}
+}
+
+func TestDownloadAdvertisedPiecesOutOfOrder(t *testing.T) {
+	data := []byte("abcdefghij")
+	tf := &torrent.TorrentFile{
+		Length: 10, PieceLength: 4,
+		Pieces: [][20]byte{sha1.Sum(data[:4]), sha1.Sum(data[4:8]), sha1.Sum(data[8:])},
+	}
+	var replies, wantRequests []byte
+	// Advertise the final piece first, then pieces zero and one. Include a
+	// duplicate have so a completed piece must not be downloaded twice.
+	for _, index := range []int{2, 0, 1} {
+		replies = append(replies, 0, 0, 0, 0) // keep-alive
+		if index == 0 {
+			replies = append(replies, 0, 0, 0, 5, 4, 0, 0, 0, 2)
+		}
+		replies = append(replies, 0, 0, 0, 5, 4, 0, 0, 0, byte(index))
+		piece := data[index*4 : min(index*4+4, len(data))]
+		replies = binary.BigEndian.AppendUint32(replies, uint32(9+len(piece)))
+		replies = append(replies, byte(peer.MsgPiece))
+		replies = binary.BigEndian.AppendUint32(replies, uint32(index))
+		replies = binary.BigEndian.AppendUint32(replies, 0)
+		replies = append(replies, piece...)
+		wantRequests = append(wantRequests, 0, 0, 0, 13, 6, 0, 0, 0, byte(index), 0, 0, 0, 0)
+		wantRequests = binary.BigEndian.AppendUint32(wantRequests, uint32(len(piece)))
+		wantRequests = append(wantRequests, 0, 0, 0, 5, byte(peer.MsgHave), 0, 0, 0, byte(index))
+	}
+	conn := &pieceTestConn{incoming: bytes.NewReader(replies)}
+	client, err := peer.NewClient(conn, peer.Handshake{}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Choked = false
+	dst := &downloadTestWriter{}
+	if err := Download(client, tf, dst); err != nil {
+		t.Fatalf("Download() error: %v", err)
+	}
+	if !bytes.Equal(conn.outgoing.Bytes(), wantRequests) {
+		t.Errorf("requests = %x, want %x", conn.outgoing.Bytes(), wantRequests)
+	}
+	if len(dst.writes) != 3 {
+		t.Fatalf("writes = %d, want 3", len(dst.writes))
+	}
+	for i, index := range []int{2, 0, 1} {
+		want := data[index*4 : min(index*4+4, len(data))]
+		if dst.writes[i].offset != int64(index*4) || !bytes.Equal(dst.writes[i].data, want) {
+			t.Errorf("write %d = %+v, want offset %d, data %q", i, dst.writes[i], index*4, want)
+		}
 	}
 }
