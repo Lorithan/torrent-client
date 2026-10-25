@@ -10,6 +10,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/lorithan/torrent-client/internal/download"
+	"github.com/lorithan/torrent-client/internal/peer"
 	"github.com/lorithan/torrent-client/internal/torrent"
 	"github.com/lorithan/torrent-client/internal/tracker"
 )
@@ -66,16 +68,86 @@ func run() error {
 
 	log.Printf("current addr: %d", addr.Port)
 	peerID := tracker.GeneratePeerID()
-	client := http.Client{
+	httpClient := http.Client{
 		Timeout: 15 * time.Second,
 	}
 
-	response, err := tracker.Announce(torrentData, peerID, uint16(addr.Port), &client)
+	response, err := tracker.Announce(torrentData, peerID, uint16(addr.Port), &httpClient)
 	if err != nil {
 		return err
 	}
 
 	log.Printf("interval: %s, peers: %v", response.Interval, response.Peers)
 
+	if len(response.Peers) == 0 {
+		return fmt.Errorf("No peers found")
+	}
+
+	handshake := peer.Handshake{
+		InfoHash: torrentData.InfoHash,
+		PeerID:   peerID,
+	}
+
+	conn, receivedHandshake, err := connectToPeer(response.Peers, handshake)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	log.Printf("recieved peerID: %x", receivedHandshake.PeerID)
+
+	client, err := peer.NewClient(conn, *receivedHandshake, len(torrentData.Pieces))
+	if err != nil {
+		return err
+	}
+
+	err = client.Conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if err != nil {
+		return err
+	}
+	err = client.WaitForUnchoke()
+	if err != nil {
+		return err
+	}
+	err = client.Conn.SetDeadline(time.Time{})
+	if err != nil {
+		return err
+	}
+
+	file, err := os.OpenFile(*output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	err = client.Conn.SetDeadline(time.Now().Add(5 * time.Minute))
+	if err != nil {
+		return err
+	}
+	err = download.Download(client, torrentData, file)
+	if err != nil {
+		return err
+	}
+
+	err = file.Close()
+	if err != nil {
+		return err
+	}
+
+	log.Printf("download complete")
+
 	return nil
+}
+
+func connectToPeer(addrs []net.TCPAddr, local peer.Handshake) (net.Conn, *peer.Handshake, error) {
+	for _, addr := range addrs {
+		conn, received, err := peer.Connect(addr, local)
+		if err != nil {
+			log.Printf("error at addr %s: %s", &addr, err)
+		} else {
+			return conn, received, err
+		}
+	}
+
+	return nil, nil, fmt.Errorf("no successful connection with peers")
 }
