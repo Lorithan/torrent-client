@@ -61,7 +61,10 @@ func DownloadPiece(client *peer.Client, tf *torrent.TorrentFile, index int) ([]b
 
 	err = client.WaitForPiece(index)
 	if err != nil {
-		return nil, err
+		return nil, &PeerError{
+			Op:  fmt.Sprintf("wait for piece %d", index),
+			Err: err,
+		}
 	}
 
 	piece := make([]byte, 0, pieceSize)
@@ -76,7 +79,10 @@ func DownloadPiece(client *peer.Client, tf *torrent.TorrentFile, index int) ([]b
 
 		block, err := client.DownloadBlock(uint32(index), uint32(offset), uint32(length))
 		if err != nil {
-			return nil, err
+			return nil, &PeerError{
+				Op:  fmt.Sprintf("download piece %d block at offset %d", index, offset),
+				Err: err,
+			}
 		}
 
 		piece = append(piece, block...)
@@ -86,7 +92,10 @@ func DownloadPiece(client *peer.Client, tf *torrent.TorrentFile, index int) ([]b
 	hash := sha1.Sum(piece)
 
 	if hash != tf.Pieces[index] {
-		return nil, fmt.Errorf("piece %d hash does not match expected hash", index)
+		return nil, &PeerError{
+			Op:  fmt.Sprintf("verify piece %d", index),
+			Err: fmt.Errorf("piece %d hash does not match expected hash", index),
+		}
 	}
 
 	return piece, nil

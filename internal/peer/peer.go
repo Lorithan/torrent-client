@@ -118,8 +118,17 @@ func (c *Client) WaitForUnchoke() error {
 }
 
 func (c *Client) WaitForPiece(index int) error {
-	if index >= c.PieceCount {
+	if index >= c.PieceCount || index < 0 {
 		return fmt.Errorf("index out of bounds")
+	}
+
+	if !c.Choked && c.Bitfield.HasPiece(index) {
+		return nil
+	}
+
+	err := c.Conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if err != nil {
+		return err
 	}
 
 	for c.Choked || !c.Bitfield.HasPiece(index) {
@@ -132,6 +141,11 @@ func (c *Client) WaitForPiece(index int) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	err = c.Conn.SetDeadline(time.Time{})
+	if err != nil {
+		return err
 	}
 
 	return nil

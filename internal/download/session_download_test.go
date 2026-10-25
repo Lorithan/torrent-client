@@ -84,8 +84,10 @@ func TestSessionDownloadFromRetainsCommittedPieceOnHaveFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DownloadFrom(first); !errors.Is(err, wantErr) {
-		t.Fatalf("error = %v, want have failure", err)
+	err = s.DownloadFrom(first)
+	var classified *PeerError
+	if !errors.Is(err, wantErr) || !errors.As(err, &classified) {
+		t.Fatalf("error = %v, want peer failure preserving the have-send cause", err)
 	}
 	if s.completedCount != 1 || !s.completed.HasPiece(0) || len(dst.writes) != 1 {
 		t.Error("announcement failure lost the successfully stored piece")
@@ -103,8 +105,13 @@ func TestSessionDownloadFromDoesNotCommitFailedWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DownloadFrom(client); !errors.Is(err, wantErr) {
+	err = s.DownloadFrom(client)
+	if !errors.Is(err, wantErr) {
 		t.Errorf("error = %v, want storage failure", err)
+	}
+	var classified *PeerError
+	if errors.As(err, &classified) {
+		t.Errorf("storage failure was incorrectly classified as retryable: %v", err)
 	}
 	if s.completedCount != 0 || s.completed.HasPiece(0) {
 		t.Error("failed output write committed progress")

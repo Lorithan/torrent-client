@@ -59,23 +59,35 @@ func (s *Session) DownloadFrom(client *peer.Client) error {
 		if !found {
 			err := client.Conn.SetDeadline(time.Now().Add(30 * time.Second))
 			if err != nil {
-				return err
+				return &PeerError{
+					Op:  "set availability deadline",
+					Err: err,
+				}
 			}
 			for !found {
 				message, err := peer.ReadMessage(client.Conn)
 				if err != nil {
-					return err
+					return &PeerError{
+						Op:  "wait for available piece",
+						Err: err,
+					}
 				}
 
 				err = client.HandleMessage(message)
 				if err != nil {
-					return err
+					return &PeerError{
+						Op:  "handle availability message",
+						Err: err,
+					}
 				}
 				index, found = SelectPiece(client.Bitfield, s.completed, len(s.torrent.Pieces))
 			}
 			err = client.Conn.SetDeadline(time.Time{})
 			if err != nil {
-				return err
+				return &PeerError{
+					Op:  "clear availability deadline",
+					Err: err,
+				}
 			}
 		}
 
@@ -86,7 +98,7 @@ func (s *Session) DownloadFrom(client *peer.Client) error {
 
 		n, err := s.dest.WriteAt(piece, int64(index)*s.torrent.PieceLength)
 		if err != nil {
-			return err
+			return fmt.Errorf("write piece %d: %w", index, err)
 		}
 
 		err = s.completed.SetPiece(index)
@@ -98,15 +110,24 @@ func (s *Session) DownloadFrom(client *peer.Client) error {
 		message := peer.NewHave(uint32(index))
 		err = client.Conn.SetDeadline(time.Now().Add(30 * time.Second))
 		if err != nil {
-			return err
+			return &PeerError{
+				Op:  fmt.Sprintf("set deadline to announce piece %d", index),
+				Err: err,
+			}
 		}
 		err = client.SendMessage(message)
 		if err != nil {
-			return err
+			return &PeerError{
+				Op:  fmt.Sprintf("announce piece %d", index),
+				Err: err,
+			}
 		}
 		err = client.Conn.SetDeadline(time.Time{})
 		if err != nil {
-			return err
+			return &PeerError{
+				Op:  fmt.Sprintf("clear deadline after announcing piece %d", index),
+				Err: err,
+			}
 		}
 
 		log.Printf("Piece %d completed, %d/%d, %d bytes written", index, s.completedCount, len(s.torrent.Pieces), n)
