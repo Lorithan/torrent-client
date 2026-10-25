@@ -305,9 +305,28 @@ func TestDownloadFromPeersStopsOnStorageError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Reusing the address makes any inappropriate retry fail instead of hiding
-	// the original storage error. A storage failure must be returned immediately.
-	err = downloadFromPeers([]net.TCPAddr{addr, addr}, local, 2, s)
+	// Observe the spare listener directly: checking only the returned error could
+	// miss an unnecessary attempt that happens before returning the storage cause.
+	spare, listenErr := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if listenErr != nil {
+		t.Fatal(listenErr)
+	}
+	t.Cleanup(func() { spare.Close() })
+	attempted := make(chan bool, 1)
+	go func() {
+		conn, err := spare.AcceptTCP()
+		if err != nil {
+			attempted <- false
+			return
+		}
+		conn.Close()
+		attempted <- true
+	}()
+	err = downloadFromPeers([]net.TCPAddr{addr, *spare.Addr().(*net.TCPAddr)}, local, 2, s)
+	spare.Close()
+	if <-attempted {
+		t.Error("storage failure attempted a replacement peer")
+	}
 	if !errors.Is(err, wantErr) {
 		t.Errorf("error = %v, want storage cause", err)
 	}
