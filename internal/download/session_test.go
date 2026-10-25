@@ -2,12 +2,247 @@ package download
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net"
 	"testing"
+	"testing/iotest"
 
+	"github.com/lorithan/torrent-client/internal/peer"
 	"github.com/lorithan/torrent-client/internal/torrent"
 )
+
+func TestSessionDownloadFromRetainsProgressAfterInterruptedPiece(t *testing.T) {
+	first, tf, firstConn, data := downloadFixture(t, 4, 10, -1)
+	allReplies := make([]byte, firstConn.incoming.Len())
+	if _, err := io.ReadFull(firstConn.incoming, allReplies); err != nil {
+		t.Fatal(err)
+	}
+	// Complete piece zero, then disconnect after only two bytes of piece one's data.
+	firstConn.incoming = bytes.NewReader(allReplies[:17+13+2])
+	dst := &downloadTestWriter{}
+	s, err := NewSession(tf, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DownloadFrom(first); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("first attempt error = %v, want truncated piece error", err)
+	}
+	if s.completedCount != 1 || !s.completed.HasPiece(0) || s.completed.HasPiece(1) {
+		t.Fatalf("progress after failure = count %d, bitfield %x; want only piece zero complete", s.completedCount, s.completed)
+	}
+	if s.Complete() {
+		t.Error("session reported completion after an interrupted piece")
+	}
+	second, _, secondConn, _ := downloadFixture(t, 4, 10, -1)
+	secondConn.incoming = bytes.NewReader(allReplies[17:])
+	if err := s.DownloadFrom(second); err != nil {
+		t.Fatal(err)
+	}
+	// The new peer must restart piece one at offset zero, then request piece two.
+	want := []byte{
+		0, 0, 0, 13, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4,
+		0, 0, 0, 5, 4, 0, 0, 0, 1,
+		0, 0, 0, 13, 6, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 2,
+		0, 0, 0, 5, 4, 0, 0, 0, 2,
+	}
+	if !bytes.Equal(secondConn.outgoing.Bytes(), want) {
+		t.Errorf("second peer received %x, want %x", secondConn.outgoing.Bytes(), want)
+	}
+	if s.completedCount != 3 {
+		t.Errorf("completed count = %d, want 3", s.completedCount)
+	}
+	if !s.Complete() {
+		t.Error("session did not report completion after the second peer finished")
+	}
+	if len(dst.writes) != 3 {
+		t.Fatalf("writes = %d, want 3", len(dst.writes))
+	}
+	for i, w := range dst.writes {
+		if w.offset != int64(i*4) || !bytes.Equal(w.data, data[i*4:min(i*4+4, len(data))]) {
+			t.Errorf("incorrect write %d: %+v", i, w)
+		}
+	}
+	// A completed session should need neither another peer nor more output writes.
+	if err := s.DownloadFrom(nil); err != nil {
+		t.Errorf("completed session: %v", err)
+	}
+	if len(dst.writes) != 3 {
+		t.Error("completed session wrote pieces again")
+	}
+}
+
+func TestSessionDownloadFromRetainsCommittedPieceOnHaveFailure(t *testing.T) {
+	first, tf, conn, _ := downloadFixture(t, 4, 4, -1)
+	wantErr := errors.New("have write failed")
+	first.Conn = &sessionHaveFailureConn{pieceTestConn: conn, err: wantErr}
+	dst := &downloadTestWriter{}
+	s, err := NewSession(tf, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.DownloadFrom(first)
+	var classified *PeerError
+	if !errors.Is(err, wantErr) || !errors.As(err, &classified) {
+		t.Fatalf("error = %v, want peer failure preserving the have-send cause", err)
+	}
+	if s.completedCount != 1 || !s.completed.HasPiece(0) || len(dst.writes) != 1 {
+		t.Error("announcement failure lost the successfully stored piece")
+	}
+	if !s.Complete() {
+		t.Error("final announcement failure hid successful file completion")
+	}
+	if err := s.DownloadFrom(nil); err != nil {
+		t.Errorf("completed session should not redownload: %v", err)
+	}
+}
+
+func TestSessionDownloadFromDoesNotCommitFailedWrite(t *testing.T) {
+	client, tf, conn, _ := downloadFixture(t, 4, 4, -1)
+	wantErr := errors.New("disk full")
+	dst := &downloadTestWriter{failAt: 1, err: wantErr}
+	s, err := NewSession(tf, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.DownloadFrom(client)
+	if !errors.Is(err, wantErr) {
+		t.Errorf("error = %v, want storage failure", err)
+	}
+	var classified *PeerError
+	if errors.As(err, &classified) {
+		t.Errorf("storage failure was incorrectly classified as retryable: %v", err)
+	}
+	if s.completedCount != 0 || s.completed.HasPiece(0) {
+		t.Error("failed output write committed progress")
+	}
+	if s.Complete() {
+		t.Error("failed storage write was reported as a completed download")
+	}
+	if conn.outgoing.Len() != 17 {
+		t.Error("failed output write announced completion")
+	}
+}
+
+func TestSessionClassifiesAvailabilityAndAnnouncementDeadlineFailures(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		failAt    int
+		completed int
+	}{
+		{"set availability deadline", 1, 0},
+		{"clear availability deadline", 2, 0},
+		{"set announcement deadline", 5, 1},
+		{"clear announcement deadline", 6, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client, tf, conn := availabilityDeadlineFixture(t)
+			wantErr := errors.New("deadline failed")
+			conn.failAt, conn.err = tt.failAt, wantErr
+			s, err := NewSession(tf, &downloadTestWriter{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = s.DownloadFrom(client)
+			var classified *PeerError
+			if !errors.As(err, &classified) || !errors.Is(err, wantErr) {
+				t.Fatalf("error = %v, want PeerError preserving deadline cause", err)
+			}
+			if classified.Op == "" {
+				t.Error("missing operation context")
+			}
+			if s.completedCount != tt.completed {
+				t.Errorf("completed = %d, want %d", s.completedCount, tt.completed)
+			}
+		})
+	}
+}
+
+func TestSessionClassifiesAvailabilityMessageFailures(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		wire  []byte
+		cause error
+	}{
+		{"disconnect", nil, io.EOF},
+		{"malformed message", []byte{0, 0, 0, 2, byte(peer.MsgUnchoke), 42}, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client, tf, conn := availabilityDeadlineFixture(t)
+			conn.incoming = bytes.NewReader(tt.wire)
+			s, err := NewSession(tf, &downloadTestWriter{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = s.DownloadFrom(client)
+			var classified *PeerError
+			if !errors.As(err, &classified) {
+				t.Fatalf("error = %v, want PeerError", err)
+			}
+			if tt.cause != nil && !errors.Is(err, tt.cause) {
+				t.Errorf("lost underlying error: %v", err)
+			}
+			if s.completedCount != 0 || conn.outgoing.Len() != 0 {
+				t.Error("availability failure committed progress or sent a request")
+			}
+		})
+	}
+}
+
+func TestSessionRetainsProgressAfterTimeout(t *testing.T) {
+	for _, phase := range []string{"availability", "block response"} {
+		t.Run(phase, func(t *testing.T) {
+			first, tf, fixtureConn, data := downloadFixture(t, 4, 10, -1)
+			replies := make([]byte, fixtureConn.incoming.Len())
+			if _, err := io.ReadFull(fixtureConn.incoming, replies); err != nil {
+				t.Fatal(err)
+			}
+			beforeTimeout := append([]byte(nil), replies[:17+13+2]...)
+			if phase == "availability" {
+				first.Bitfield = []byte{0x80}
+				beforeTimeout = append(append([]byte(nil), replies[:17]...), 0, 0, 0, 0)
+			}
+			timeout := &pieceTestTimeout{}
+			// Inject a real net.Error shape after partial progress rather than waiting
+			// 30 seconds. Separate deadline tests verify the actual timer placement.
+			failedConn := &pieceErrorTestConn{reader: io.MultiReader(bytes.NewReader(beforeTimeout), iotest.ErrReader(timeout))}
+			first.Conn = failedConn
+			dst := &downloadTestWriter{}
+			session, err := NewSession(tf, dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = session.DownloadFrom(first)
+			var classified *PeerError
+			var networkErr net.Error
+			if !errors.As(err, &classified) || !errors.As(err, &networkErr) || !networkErr.Timeout() || !errors.Is(err, timeout) {
+				t.Fatalf("error = %v, want peer failure preserving timeout", err)
+			}
+			if session.completedCount != 1 || !session.completed.HasPiece(0) || session.completed.HasPiece(1) || session.Complete() || len(dst.writes) != 1 {
+				t.Fatal("timeout lost committed progress or committed unfinished data")
+			}
+			second, _, secondConn, _ := downloadFixture(t, 4, 10, -1)
+			secondConn.incoming = bytes.NewReader(replies[17:])
+			if err := session.DownloadFrom(second); err != nil {
+				t.Fatal(err)
+			}
+			wantFirstRequest := []byte{0, 0, 0, 13, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4}
+			if sent := secondConn.outgoing.Bytes(); len(sent) < 17 || !bytes.Equal(sent[:17], wantFirstRequest) {
+				t.Errorf("replacement did not restart unfinished piece one at offset zero: %x", sent)
+			}
+			if !session.Complete() || len(dst.writes) != 3 {
+				t.Fatal("replacement did not complete each piece exactly once")
+			}
+			for i, write := range dst.writes {
+				if write.offset != int64(i*4) || !bytes.Equal(write.data, data[i*4:min(i*4+4, len(data))]) {
+					t.Errorf("incorrect verified output at write %d: %+v", i, write)
+				}
+			}
+		})
+	}
+}
 
 func TestNewSession(t *testing.T) {
 	for _, tt := range []struct {

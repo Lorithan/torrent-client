@@ -10,49 +10,65 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/lorithan/torrent-client/internal/peer"
 	"github.com/lorithan/torrent-client/internal/torrent"
 )
 
-func downloadFixture(t *testing.T, pieceLength, fileLength, corruptIndex int) (*peer.Client, *torrent.TorrentFile, *pieceTestConn, []byte) {
-	t.Helper()
-	data := make([]byte, fileLength)
-	for i := range data {
-		data[i] = byte(i*31 + i/pieceLength)
-	}
-	tf := &torrent.TorrentFile{Length: int64(fileLength), PieceLength: int64(pieceLength)}
-	var replies []byte
-	for start, index := 0, 0; start < len(data); index++ {
-		piece := data[start:min(start+pieceLength, len(data))]
-		tf.Pieces = append(tf.Pieces, sha1.Sum(piece))
-		for begin := 0; begin < len(piece); {
-			length := min(16384, len(piece)-begin)
-			replies = binary.BigEndian.AppendUint32(replies, uint32(9+length))
-			replies = append(replies, byte(peer.MsgPiece))
-			replies = binary.BigEndian.AppendUint32(replies, uint32(index))
-			replies = binary.BigEndian.AppendUint32(replies, uint32(begin))
-			block := append([]byte(nil), piece[begin:begin+length]...)
-			if index == corruptIndex {
-				block[0] ^= 0xff
-			}
-			replies = append(replies, block...)
-			begin += length
-		}
-		start += len(piece)
-	}
-	conn := &pieceTestConn{incoming: bytes.NewReader(replies)}
-	client, err := peer.NewClient(conn, peer.Handshake{}, len(tf.Pieces))
-	if err != nil {
+func TestDownloadAvailabilityDeadlineIsNotRenewedByMessages(t *testing.T) {
+	client, tf, conn := availabilityDeadlineFixture(t)
+	dst := &downloadTestWriter{}
+	before := time.Now()
+	if err := Download(client, tf, dst); err != nil {
 		t.Fatal(err)
 	}
-	client.Choked = false
-	for index := range tf.Pieces {
-		if err := client.Bitfield.SetPiece(index); err != nil {
-			t.Fatal(err)
+	after := time.Now()
+	// One set/clear pair each for availability, the block request, and the have.
+	if len(conn.deadlines) != 6 {
+		t.Fatalf("deadline calls = %d, want 6; unrelated messages must not renew the availability deadline", len(conn.deadlines))
+	}
+	for i, d := range conn.deadlines {
+		if i%2 == 1 {
+			if !d.IsZero() {
+				t.Errorf("deadline call %d should clear, got %v", i, d)
+			}
+		} else if d.Before(before.Add(30*time.Second)) || d.After(after.Add(30*time.Second)) {
+			t.Errorf("deadline call %d should establish a fresh 30-second allowance, got %v", i, d)
 		}
 	}
-	return client, tf, conn, data
+	if len(dst.writes) != 1 || !bytes.Equal(dst.writes[0].data, []byte("data")) {
+		t.Error("piece was not written correctly")
+	}
+}
+
+func TestDownloadAvailabilityDeadlineErrors(t *testing.T) {
+	for _, name := range []string{"setting", "clearing"} {
+		t.Run(name, func(t *testing.T) {
+			client, tf, conn := availabilityDeadlineFixture(t)
+			if name == "clearing" {
+				// Omit keep-alives here so this test specifically exercises the clear.
+				remaining := make([]byte, conn.incoming.Len())
+				_, _ = conn.incoming.Read(remaining)
+				conn.incoming = bytes.NewReader(remaining[8:])
+				conn.failAt = 2
+			} else {
+				conn.failAt = 1
+			}
+			wantErr := errors.New("deadline failed")
+			conn.err = wantErr
+			dst := &downloadTestWriter{}
+			if err := Download(client, tf, dst); !errors.Is(err, wantErr) {
+				t.Errorf("error = %v, want deadline error", err)
+			}
+			if conn.outgoing.Len() != 0 || len(dst.writes) != 0 {
+				t.Error("performed a download after deadline failure")
+			}
+			if name == "setting" && conn.reads != 0 {
+				t.Error("read before establishing availability deadline")
+			}
+		})
+	}
 }
 
 func TestDownloadWritesCompleteFile(t *testing.T) {
@@ -84,15 +100,6 @@ func TestDownloadWritesCompleteFile(t *testing.T) {
 	}
 }
 
-type downloadWrite struct {
-	offset int64
-	data   []byte
-}
-
-type completionTestWriterFunc func([]byte, int64) (int, error)
-
-func (f completionTestWriterFunc) WriteAt(p []byte, offset int64) (int, error) { return f(p, offset) }
-
 func TestDownloadDoesNotAnnounceBeforeWrite(t *testing.T) {
 	client, tf, conn, _ := downloadFixture(t, 4, 10, -1)
 	wantErr := errors.New("disk full")
@@ -111,20 +118,6 @@ func TestDownloadDoesNotAnnounceBeforeWrite(t *testing.T) {
 	if calls != 1 || conn.outgoing.Len() != 17 {
 		t.Errorf("writes = %d, sent bytes = %d; a failed write must not announce completion", calls, conn.outgoing.Len())
 	}
-}
-
-type downloadTestWriter struct {
-	writes []downloadWrite
-	failAt int
-	err    error
-}
-
-func (w *downloadTestWriter) WriteAt(p []byte, offset int64) (int, error) {
-	w.writes = append(w.writes, downloadWrite{offset, append([]byte(nil), p...)})
-	if len(w.writes) == w.failAt {
-		return len(p) / 2, w.err
-	}
-	return len(p), nil
 }
 
 func TestDownloadDoesNotWriteCorruptedPiece(t *testing.T) {

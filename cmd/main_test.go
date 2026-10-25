@@ -19,7 +19,97 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lorithan/torrent-client/internal/peer"
 )
+
+func TestRunContinuesWithSecondPeer(t *testing.T) {
+	firstHash, secondHash := sha1.Sum([]byte("abcd")), sha1.Sum([]byte("efgh"))
+	info := "d6:lengthi8e4:name8:file.bin12:piece lengthi4e6:pieces40:" + string(firstHash[:]) + string(secondHash[:]) + "e"
+	infoHash := sha1.Sum([]byte(info))
+	local := peer.Handshake{InfoHash: infoHash}
+	// The CLI creates a random session ID. Hand the announced value to each fake
+	// peer through a channel to check identity reuse without shared-memory races.
+	announcedIDs := make(chan string, 2)
+	verify := func(wire [68]byte) error {
+		var id string
+		select {
+		case id = <-announcedIDs:
+		default:
+			return fmt.Errorf("peer connected without an announce")
+		}
+		if wire[0] != 19 || string(wire[1:20]) != "BitTorrent protocol" || !bytes.Equal(wire[28:48], infoHash[:]) || string(wire[48:]) != id {
+			return fmt.Errorf("handshake does not match torrent and announced session identity")
+		}
+		return nil
+	}
+	first, firstDone := startFallbackTestPeerWithVerifier(t, local, func(conn net.Conn) error {
+		if err := fallbackTestRequest(conn, 0); err != nil {
+			return err
+		}
+		if err := fallbackTestReply(conn, 0, []byte("abcd")); err != nil {
+			return err
+		}
+		if err := fallbackTestHave(conn, 0); err != nil {
+			return err
+		}
+		if err := fallbackTestRequest(conn, 1); err != nil {
+			return err
+		}
+		return fallbackTestReply(conn, 1, []byte("ef"))
+	}, verify)
+	second, secondDone := startFallbackTestPeerWithVerifier(t, local, func(conn net.Conn) error {
+		if err := fallbackTestRequest(conn, 1); err != nil {
+			return err
+		}
+		if err := fallbackTestReply(conn, 1, []byte("efgh")); err != nil {
+			return err
+		}
+		if err := fallbackTestHave(conn, 1); err != nil {
+			return err
+		}
+		var next [1]byte
+		if _, err := conn.Read(next[:]); err != io.EOF {
+			return fmt.Errorf("expected CLI cleanup, got %v", err)
+		}
+		return nil
+	}, verify)
+	var compact []byte
+	for _, addr := range []net.TCPAddr{first, second} {
+		compact = append(compact, 127, 0, 0, 1)
+		compact = binary.BigEndian.AppendUint16(compact, uint16(addr.Port))
+	}
+	tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("peer_id")
+		announcedIDs <- id
+		announcedIDs <- id
+		_, _ = io.WriteString(w, "d8:intervali1800e5:peers12:"+string(compact)+"e")
+	}))
+	t.Cleanup(tracker.Close)
+	dir := t.TempDir()
+	torrentPath, outputPath := filepath.Join(dir, "input.torrent"), filepath.Join(dir, "output.bin")
+	meta := fmt.Appendf(nil, "d8:announce%d:%s4:info%se", len(tracker.URL), tracker.URL, info)
+	if err := os.WriteFile(torrentPath, meta, 0600); err != nil {
+		t.Fatal(err)
+	}
+	prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
+	if err := run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-firstDone; err != nil {
+		t.Errorf("first peer: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Errorf("second peer: %v", err)
+	}
+	got, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("abcdefgh")) {
+		t.Errorf("saved %q, want abcdefgh", got)
+	}
+}
 
 // run uses the standard flag set and logger; isolate their process-wide state
 // between tests. These tests must remain sequential.
