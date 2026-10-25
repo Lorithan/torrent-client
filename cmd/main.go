@@ -113,6 +113,21 @@ func run() error {
 		return err
 	}
 
+	if torrentData.Length > 0 {
+		stats := session.Stats()
+		params = tracker.AnnounceParams{
+			Uploaded:   stats.Uploaded,
+			Downloaded: stats.Downloaded,
+			Left:       stats.Left,
+			Event:      tracker.AnnounceEventCompleted,
+		}
+
+		_, err = tracker.Announce(torrentData, peerID, uint16(addr.Port), &httpClient, params)
+		if err != nil {
+			log.Printf("complete announce error: %s", err)
+		}
+	}
+
 	log.Printf("download complete")
 
 	return nil

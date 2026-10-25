@@ -31,6 +31,7 @@ func TestRunContinuesWithSecondPeer(t *testing.T) {
 	// The CLI creates a random session ID. Hand the announced value to each fake
 	// peer through a channel to check identity reuse without shared-memory races.
 	announcedIDs := make(chan string, 2)
+	lifecycle := make(chan url.Values, 4)
 	verify := func(wire [68]byte) error {
 		var id string
 		select {
@@ -80,9 +81,13 @@ func TestRunContinuesWithSecondPeer(t *testing.T) {
 		compact = binary.BigEndian.AppendUint16(compact, uint16(addr.Port))
 	}
 	tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.URL.Query().Get("peer_id")
-		announcedIDs <- id
-		announcedIDs <- id
+		query := r.URL.Query()
+		lifecycle <- query
+		if query.Get("event") == "started" {
+			id := query.Get("peer_id")
+			announcedIDs <- id
+			announcedIDs <- id
+		}
 		_, _ = io.WriteString(w, "d8:intervali1800e5:peers12:"+string(compact)+"e")
 	}))
 	t.Cleanup(tracker.Close)
@@ -109,6 +114,15 @@ func TestRunContinuesWithSecondPeer(t *testing.T) {
 	if !bytes.Equal(got, []byte("abcdefgh")) {
 		t.Errorf("saved %q, want abcdefgh", got)
 	}
+	if len(lifecycle) != 2 {
+		t.Fatalf("announce count = %d, want started and completed", len(lifecycle))
+	}
+	started, completed := <-lifecycle, <-lifecycle
+	for key, want := range map[string]string{"event": "completed", "uploaded": "0", "downloaded": "8", "left": "0", "peer_id": started.Get("peer_id"), "port": started.Get("port"), "info_hash": started.Get("info_hash")} {
+		if got := completed.Get(key); got != want {
+			t.Errorf("completion query[%q] = %q, want %q", key, got, want)
+		}
+	}
 }
 
 // run uses the standard flag set and logger; isolate their process-wide state
@@ -134,13 +148,14 @@ func prepareRun(t *testing.T, args ...string) *bytes.Buffer {
 }
 
 func TestRunDownload(t *testing.T) {
-	for _, scenario := range []string{"success", "existing output", "corrupted data", "peer disconnect"} {
+	for _, scenario := range []string{"success", "completion tracker failure", "existing output", "corrupted data", "peer disconnect"} {
 		t.Run(scenario, func(t *testing.T) { runDownloadScenario(t, scenario) })
 	}
 }
 
 func runDownloadScenario(t *testing.T, scenario string) {
 	t.Helper()
+	successful := scenario == "success" || scenario == "completion tracker failure"
 	contents := []byte("data")
 	pieceHash := sha1.Sum(contents)
 	info := "d6:lengthi4e4:name8:file.bin12:piece lengthi4e6:pieces20:" + string(pieceHash[:]) + "e"
@@ -233,7 +248,7 @@ func runDownloadScenario(t *testing.T, scenario string) {
 				return
 			}
 		}
-		if scenario == "success" {
+		if successful {
 			var have [9]byte
 			if _, err := io.ReadFull(conn, have[:]); err != nil {
 				result.err = fmt.Errorf("reading completion announcement: %w", err)
@@ -254,11 +269,16 @@ func runDownloadScenario(t *testing.T, scenario string) {
 	}()
 	compactPeer := []byte{127, 0, 0, 1}
 	compactPeer = binary.BigEndian.AppendUint16(compactPeer, uint16(peerListener.Addr().(*net.TCPAddr).Port))
-	requests := make(chan url.Values, 1)
+	requests := make(chan url.Values, 4)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests <- r.URL.Query()
 		if r.Method != http.MethodGet {
 			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if scenario == "completion tracker failure" && r.URL.Query().Get("event") == "completed" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, "completion tracker unavailable")
+			return
 		}
 		_, _ = io.WriteString(w, "d8:intervali1800e5:peers6:"+string(compactPeer)+"e")
 	}))
@@ -286,7 +306,7 @@ func runDownloadScenario(t *testing.T, scenario string) {
 	if result.err != nil {
 		t.Fatal(result.err)
 	}
-	if scenario == "success" {
+	if successful {
 		if runErr != nil {
 			t.Fatal(runErr)
 		}
@@ -332,6 +352,27 @@ func runDownloadScenario(t *testing.T, scenario string) {
 		if !strings.Contains(output.String(), fmt.Sprintf("current addr: %d", port)) {
 			t.Error("announced port differs from logged listening port")
 		}
+		if successful {
+			select {
+			case completed := <-requests:
+				for key, want := range map[string]string{"event": "completed", "uploaded": "0", "downloaded": "4", "left": "0", "port": query.Get("port"), "peer_id": query.Get("peer_id"), "info_hash": query.Get("info_hash")} {
+					if got := completed.Get(key); got != want {
+						t.Errorf("completion query[%q] = %q, want %q", key, got, want)
+					}
+				}
+			default:
+				t.Error("tracker did not receive completion announce")
+			}
+			if !strings.Contains(output.String(), "download complete") {
+				t.Error("verified output was not reported successful")
+			}
+			if scenario == "completion tracker failure" && !strings.Contains(output.String(), "503") {
+				t.Error("completion announce failure was not logged with its cause")
+			}
+		}
+		if len(requests) != 0 {
+			t.Error("unexpected extra lifecycle announce")
+		}
 		// run must release the listener when it returns.
 		listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err != nil {
@@ -347,7 +388,7 @@ func runDownloadScenario(t *testing.T, scenario string) {
 		t.Fatal(err)
 	}
 	switch scenario {
-	case "success":
+	case "success", "completion tracker failure":
 		if !bytes.Equal(saved, contents) {
 			t.Errorf("saved %q, want %q", saved, contents)
 		}
@@ -414,7 +455,9 @@ func TestRunNoPeers(t *testing.T) {
 			name = "empty torrent"
 		}
 		t.Run(name, func(t *testing.T) {
+			announces := make(chan string, 4)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				announces <- r.URL.Query().Get("event")
 				_, _ = io.WriteString(w, "d8:intervali1800e5:peers0:e")
 			}))
 			t.Cleanup(server.Close)
@@ -430,12 +473,26 @@ func TestRunNoPeers(t *testing.T) {
 			}
 			logs := prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
 			err := run()
+			if len(announces) != 1 {
+				t.Errorf("announce count = %d, want only started", len(announces))
+			}
+			select {
+			case event := <-announces:
+				if event != "started" {
+					t.Errorf("initial event = %q, want started", event)
+				}
+			default:
+				t.Error("missing initial announce")
+			}
 			if empty {
 				if err != nil {
 					t.Fatalf("empty torrent requires no peers: %v", err)
 				}
 				if !strings.Contains(logs.String(), "download complete") {
 					t.Error("empty torrent did not report completion")
+				}
+				if strings.Contains(logs.String(), "announce error") {
+					t.Error("initially complete torrent attempted an unnecessary completion announce")
 				}
 			} else {
 				if err == nil || !strings.Contains(err.Error(), "exhausted peers") {
