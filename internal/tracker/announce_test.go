@@ -31,8 +31,8 @@ func TestAnnounce(t *testing.T) {
 		query := req.URL.Query()
 		for key, want := range map[string]string{
 			"passkey": "secret", "info_hash": string(tf.InfoHash[:]), "peer_id": string(peerID[:]),
-			"port": "6881", "uploaded": "0", "downloaded": "0", "left": "10485760",
-			"compact": "1", "event": "started",
+			"port": "6881", "uploaded": "321", "downloaded": "12345678", "left": "456",
+			"compact": "1", "event": "stopped",
 		} {
 			if values := query[key]; len(values) != 1 || values[0] != want {
 				t.Errorf("query[%q] = %q, want single value %q", key, values, want)
@@ -41,7 +41,7 @@ func TestAnnounce(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: body, Header: make(http.Header)}, nil
 	})}
 
-	got, err := Announce(tf, peerID, 6881, client)
+	got, err := Announce(tf, peerID, 6881, client, AnnounceParams{Uploaded: 321, Downloaded: 12345678, Left: 456, Event: AnnounceEventStopped})
 	if err != nil {
 		t.Fatalf("Announce() error: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestAnnounceErrors(t *testing.T) {
 					Header:     make(http.Header),
 				}, nil
 			})}
-			got, err := Announce(&torrent.TorrentFile{Announce: tt.announce, Length: 1024}, [20]byte{}, 6881, client)
+			got, err := Announce(&torrent.TorrentFile{Announce: tt.announce, Length: 1024}, [20]byte{}, 6881, client, AnnounceParams{Left: 1024, Event: AnnounceEventStarted})
 			if err == nil || got != nil {
 				t.Fatalf("got (%v, %v), want nil response and error", got, err)
 			}
@@ -109,6 +109,34 @@ func TestAnnounceErrors(t *testing.T) {
 			}
 			if calls != tt.wantCalls {
 				t.Errorf("requests = %d, want %d", calls, tt.wantCalls)
+			}
+		})
+	}
+}
+
+func TestAnnounceRejectsInvalidParamsBeforeRequest(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		params AnnounceParams
+	}{
+		{"negative uploaded", AnnounceParams{Uploaded: -1}},
+		{"negative downloaded", AnnounceParams{Downloaded: -1}},
+		{"negative remaining", AnnounceParams{Left: -1}},
+		{"unsupported event", AnnounceParams{Event: AnnounceEvent("updated")}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			client := &http.Client{Transport: announceTestTransport(func(*http.Request) (*http.Response, error) {
+				calls++
+				return nil, errors.New("unexpected HTTP request")
+			})}
+			tf := &torrent.TorrentFile{Announce: "https://tracker.example/announce", Length: 1000}
+			got, err := Announce(tf, [20]byte{}, 6881, client, tt.params)
+			if got != nil || err == nil {
+				t.Errorf("got (%v, %v), want nil response and validation error", got, err)
+			}
+			if calls != 0 {
+				t.Errorf("made %d requests with invalid announce parameters", calls)
 			}
 		})
 	}

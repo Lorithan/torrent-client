@@ -73,7 +73,14 @@ func run() error {
 		Timeout: 15 * time.Second,
 	}
 
-	response, err := tracker.Announce(torrentData, peerID, uint16(addr.Port), &httpClient)
+	params := tracker.AnnounceParams{
+		Downloaded: 0,
+		Uploaded:   0,
+		Left:       torrentData.Length,
+		Event:      tracker.AnnounceEventStarted,
+	}
+
+	response, err := tracker.Announce(torrentData, peerID, uint16(addr.Port), &httpClient, params)
 	if err != nil {
 		return err
 	}

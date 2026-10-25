@@ -18,6 +18,34 @@ import (
 const PREFIX = "-CT0001-"
 const MAX_RESPONSE_SIZE = 1024 * 1024 // 1 MiB
 
+type AnnounceEvent string
+
+const (
+	AnnounceEventDefault   AnnounceEvent = ""
+	AnnounceEventStarted   AnnounceEvent = "started"
+	AnnounceEventCompleted AnnounceEvent = "completed"
+	AnnounceEventStopped   AnnounceEvent = "stopped"
+)
+
+func (e AnnounceEvent) isValid() bool {
+	validValues := []AnnounceEvent{AnnounceEventDefault, AnnounceEventStarted, AnnounceEventCompleted, AnnounceEventStopped}
+
+	for _, val := range validValues {
+		if e == val {
+			return true
+		}
+	}
+
+	return false
+}
+
+type AnnounceParams struct {
+	Uploaded   int64
+	Downloaded int64
+	Left       int64
+	Event      AnnounceEvent
+}
+
 func GeneratePeerID() [20]byte {
 
 	results := make([]byte, 20)
@@ -32,7 +60,7 @@ func GeneratePeerID() [20]byte {
 	return [20]byte(results)
 }
 
-func buildAnnounceURL(tf *torrent.TorrentFile, peerID [20]byte, port uint16) (string, error) {
+func buildAnnounceURL(tf *torrent.TorrentFile, peerID [20]byte, port uint16, params AnnounceParams) (string, error) {
 	// Parse the original announceURL
 	announceURL, err := url.Parse(tf.Announce)
 
@@ -46,11 +74,24 @@ func buildAnnounceURL(tf *torrent.TorrentFile, peerID [20]byte, port uint16) (st
 	}
 
 	if announceURL.Scheme != "http" && announceURL.Scheme != "https" {
-		return "", fmt.Errorf("Expected scheme `http` or `https`, found `%s`", announceURL.Scheme)
+		return "", fmt.Errorf("expected scheme `http` or `https`, found `%s`", announceURL.Scheme)
 	}
 
 	if port == 0 {
 		return "", fmt.Errorf("Port cannot be `0`")
+	}
+
+	if params.Downloaded < 0 {
+		return "", fmt.Errorf("download cannot be negative")
+	}
+	if params.Uploaded < 0 {
+		return "", fmt.Errorf("uploaded cannout be negative")
+	}
+	if params.Left < 0 {
+		return "", fmt.Errorf("left cannot be negative")
+	}
+	if !params.Event.isValid() {
+		return "", fmt.Errorf("event %s not valid", params.Event)
 	}
 
 	// Set query params
@@ -60,11 +101,15 @@ func buildAnnounceURL(tf *torrent.TorrentFile, peerID [20]byte, port uint16) (st
 	queries.Set("info_hash", string(infoHash[:]))
 	queries.Set("peer_id", string(peerID[:]))
 	queries.Set("port", fmt.Sprint(port))
-	queries.Set("uploaded", "0")
-	queries.Set("downloaded", "0")
-	queries.Set("left", fmt.Sprint(tf.Length))
+	queries.Set("uploaded", fmt.Sprint(params.Uploaded))
+	queries.Set("downloaded", fmt.Sprint(params.Downloaded))
+	queries.Set("left", fmt.Sprint(params.Left))
 	queries.Set("compact", "1") // Requests peers in compact binary format
-	queries.Set("event", "started")
+	if params.Event == AnnounceEventDefault {
+		queries.Del("event")
+	} else {
+		queries.Set("event", string(params.Event))
+	}
 
 	announceURL.RawQuery = queries.Encode()
 
@@ -184,8 +229,8 @@ func parseTrackerResponse(data []byte) (*TrackerResponse, error) {
 	return &response, nil
 }
 
-func Announce(tf *torrent.TorrentFile, peerID [20]byte, port uint16, httpClient *http.Client) (*TrackerResponse, error) {
-	announceURL, err := buildAnnounceURL(tf, peerID, port)
+func Announce(tf *torrent.TorrentFile, peerID [20]byte, port uint16, httpClient *http.Client, params AnnounceParams) (*TrackerResponse, error) {
+	announceURL, err := buildAnnounceURL(tf, peerID, port, params)
 
 	if err != nil {
 		return nil, err

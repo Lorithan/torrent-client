@@ -145,7 +145,7 @@ func TestBuildAnnounceURL(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tf := torrent.TorrentFile{Announce: tt.announce, InfoHash: infoHash, Length: tt.length}
 			before := tf
-			got, err := buildAnnounceURL(&tf, peerID, tt.port)
+			got, err := buildAnnounceURL(&tf, peerID, tt.port, AnnounceParams{Left: tt.length, Event: AnnounceEventStarted})
 			if err != nil {
 				t.Fatalf("BuildAnnounceURL() error = %v", err)
 			}
@@ -218,8 +218,74 @@ func TestBuildAnnounceURLRejectsInvalidInput(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tf := torrent.TorrentFile{Announce: tt.announce, Length: 1024}
-			if got, err := buildAnnounceURL(&tf, [20]byte{}, tt.port); err == nil {
+			if got, err := buildAnnounceURL(&tf, [20]byte{}, tt.port, AnnounceParams{Left: tf.Length, Event: AnnounceEventStarted}); err == nil {
 				t.Errorf("BuildAnnounceURL() = %q, nil; want error", got)
+			}
+		})
+	}
+}
+
+func TestBuildAnnounceURLTransferState(t *testing.T) {
+	for _, tt := range []struct {
+		name                              string
+		params                            AnnounceParams
+		uploaded, downloaded, left, event string
+	}{
+		{"initial", AnnounceParams{Left: 1000, Event: AnnounceEventStarted}, "0", "0", "1000", "started"},
+		{"periodic with retries", AnnounceParams{Uploaded: 65, Downloaded: 1200, Left: 500}, "65", "1200", "500", ""},
+		{"completed", AnnounceParams{Downloaded: 1200, Event: AnnounceEventCompleted}, "0", "1200", "0", "completed"},
+		{"stopped while partial", AnnounceParams{Uploaded: 10, Downloaded: 800, Left: 200, Event: AnnounceEventStopped}, "10", "800", "200", "stopped"},
+		{"large counters", AnnounceParams{Uploaded: 1 << 40, Downloaded: 1<<40 + 1, Left: 1<<40 + 2}, "1099511627776", "1099511627777", "1099511627778", ""},
+		{"maximum counters", AnnounceParams{Uploaded: 9223372036854775807, Downloaded: 9223372036854775807, Left: 9223372036854775807}, "9223372036854775807", "9223372036854775807", "9223372036854775807", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tf := &torrent.TorrentFile{Announce: "https://tracker.example/announce?passkey=a%2Bb&event=started&event=stopped&uploaded=old&downloaded=old&left=old", Length: 1000}
+			before := tt.params
+			got, err := buildAnnounceURL(tf, [20]byte{}, 6881, tt.params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			u, err := url.Parse(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			query, err := url.ParseQuery(u.RawQuery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for key, want := range map[string]string{"uploaded": tt.uploaded, "downloaded": tt.downloaded, "left": tt.left, "passkey": "a+b"} {
+				if values := query[key]; len(values) != 1 || values[0] != want {
+					t.Errorf("query[%q] = %q, want single decimal/value %q", key, values, want)
+				}
+			}
+			if tt.event == "" {
+				if values, exists := query["event"]; exists {
+					t.Errorf("regular announce retained event: %q", values)
+				}
+			} else if values := query["event"]; len(values) != 1 || values[0] != tt.event {
+				t.Errorf("event = %q, want single value %q", values, tt.event)
+			}
+			if tt.params != before {
+				t.Error("builder changed its parameters")
+			}
+		})
+	}
+}
+
+func TestBuildAnnounceURLRejectsInvalidTransferState(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		params AnnounceParams
+	}{
+		{"negative uploaded", AnnounceParams{Uploaded: -1}},
+		{"negative downloaded", AnnounceParams{Downloaded: -1}},
+		{"negative left", AnnounceParams{Left: -1}},
+		{"unknown event", AnnounceParams{Event: AnnounceEvent("updated")}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tf := &torrent.TorrentFile{Announce: "https://tracker.example/announce", Length: 1000}
+			if got, err := buildAnnounceURL(tf, [20]byte{}, 6881, tt.params); err == nil {
+				t.Errorf("accepted invalid state: %q", got)
 			}
 		})
 	}
