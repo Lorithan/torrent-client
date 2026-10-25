@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -72,7 +73,9 @@ func runDownloadScenario(t *testing.T, scenario string) {
 		var result peerResult
 		conn, err := peerListener.AcceptTCP()
 		if err != nil {
-			result.err = err
+			if scenario != "existing output" || !errors.Is(err, net.ErrClosed) {
+				result.err = err
+			}
 			peerDone <- result
 			return
 		}
@@ -185,6 +188,10 @@ func runDownloadScenario(t *testing.T, scenario string) {
 	}
 	output := prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
 	runErr := run()
+	if scenario == "existing output" {
+		// Output refusal now happens before connecting. Release the unused fake peer.
+		peerListener.Close()
+	}
 	result := <-peerDone
 	if result.err != nil {
 		t.Fatal(result.err)
@@ -200,14 +207,14 @@ func runDownloadScenario(t *testing.T, scenario string) {
 		if scenario == "existing output" && !os.IsExist(runErr) {
 			t.Errorf("expected file-exists error, got %v", runErr)
 		}
-		if scenario == "corrupted data" && !strings.Contains(runErr.Error(), "hash") {
-			t.Errorf("expected hash error, got %v", runErr)
+		if scenario == "corrupted data" && (!strings.Contains(runErr.Error(), "exhausted peers") || !strings.Contains(output.String(), "hash")) {
+			t.Errorf("expected peer exhaustion with logged hash failure, got %v; logs %q", runErr, output.String())
 		}
 	}
-	if result.handshake[0] != 19 || string(result.handshake[1:20]) != "BitTorrent protocol" || !bytes.Equal(result.handshake[20:28], make([]byte, 8)) || !bytes.Equal(result.handshake[28:48], hash[:]) {
+	if scenario != "existing output" && (result.handshake[0] != 19 || string(result.handshake[1:20]) != "BitTorrent protocol" || !bytes.Equal(result.handshake[20:28], make([]byte, 8)) || !bytes.Equal(result.handshake[28:48], hash[:])) {
 		t.Errorf("incorrect outgoing handshake: %x", result.handshake)
 	}
-	if !strings.Contains(output.String(), fmt.Sprintf("%x", remoteID)) {
+	if scenario != "existing output" && !strings.Contains(output.String(), fmt.Sprintf("%x", remoteID)) {
 		t.Error("remote peer ID was not displayed")
 	}
 	for _, want := range []string{"file.bin", "file length: 4", "piece count: 1", "127.0.0.1"} {
@@ -225,7 +232,7 @@ func runDownloadScenario(t *testing.T, scenario string) {
 		if id := query.Get("peer_id"); len(id) != 20 || !strings.HasPrefix(id, "-CT0001-") {
 			t.Errorf("invalid peer ID: %q", id)
 		}
-		if string(result.handshake[48:68]) != query.Get("peer_id") {
+		if scenario != "existing output" && string(result.handshake[48:68]) != query.Get("peer_id") {
 			t.Error("peer handshake used a different ID from the announce")
 		}
 		port, err := strconv.Atoi(query.Get("port"))
@@ -281,7 +288,6 @@ func TestRunTrackerFailures(t *testing.T) {
 		{"HTTP failure", http.StatusServiceUnavailable, "unavailable"},
 		{"tracker rejection", http.StatusOK, "d14:failure reason6:deniede"},
 		{"invalid response", http.StatusOK, "x"},
-		{"no peers", http.StatusOK, "d8:intervali1800e5:peers0:e"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -306,6 +312,54 @@ func TestRunTrackerFailures(t *testing.T) {
 			}
 			if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
 				t.Errorf("tracker failure created output or stat failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunNoPeers(t *testing.T) {
+	for _, empty := range []bool{true, false} {
+		name := "nonempty torrent"
+		if empty {
+			name = "empty torrent"
+		}
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, "d8:intervali1800e5:peers0:e")
+			}))
+			t.Cleanup(server.Close)
+			info := "d6:lengthi0e4:name8:file.bin12:piece lengthi4e6:pieces0:e"
+			if !empty {
+				info = "d6:lengthi4e4:name8:file.bin12:piece lengthi4e6:pieces20:01234567890123456789e"
+			}
+			dir := t.TempDir()
+			torrentPath, outputPath := filepath.Join(dir, "input.torrent"), filepath.Join(dir, "output.bin")
+			meta := fmt.Appendf(nil, "d8:announce%d:%s4:info%se", len(server.URL), server.URL, info)
+			if err := os.WriteFile(torrentPath, meta, 0600); err != nil {
+				t.Fatal(err)
+			}
+			logs := prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
+			err := run()
+			if empty {
+				if err != nil {
+					t.Fatalf("empty torrent requires no peers: %v", err)
+				}
+				if !strings.Contains(logs.String(), "download complete") {
+					t.Error("empty torrent did not report completion")
+				}
+			} else {
+				if err == nil || !strings.Contains(err.Error(), "exhausted peers") {
+					t.Errorf("error = %v, want peer exhaustion", err)
+				}
+				if strings.Contains(logs.String(), "download complete") {
+					t.Error("incomplete torrent reported completion")
+				}
+			}
+			// The output is now opened before the session checks for completion or
+			// peer exhaustion. An incomplete attempt retains its empty partial file.
+			data, readErr := os.ReadFile(outputPath)
+			if readErr != nil || len(data) != 0 {
+				t.Errorf("output has %d bytes, error %v; want empty file", len(data), readErr)
 			}
 		})
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -79,39 +80,9 @@ func run() error {
 
 	log.Printf("interval: %s, peers: %v", response.Interval, response.Peers)
 
-	if len(response.Peers) == 0 {
-		return fmt.Errorf("No peers found")
-	}
-
-	handshake := peer.Handshake{
+	local := peer.Handshake{
 		InfoHash: torrentData.InfoHash,
 		PeerID:   peerID,
-	}
-
-	conn, receivedHandshake, err := connectToPeer(response.Peers, handshake)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	log.Printf("recieved peerID: %x", receivedHandshake.PeerID)
-
-	client, err := peer.NewClient(conn, *receivedHandshake, len(torrentData.Pieces))
-	if err != nil {
-		return err
-	}
-
-	err = client.Conn.SetDeadline(time.Now().Add(30 * time.Second))
-	if err != nil {
-		return err
-	}
-	err = client.WaitForUnchoke()
-	if err != nil {
-		return err
-	}
-	err = client.Conn.SetDeadline(time.Time{})
-	if err != nil {
-		return err
 	}
 
 	file, err := os.OpenFile(*output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
@@ -120,7 +91,12 @@ func run() error {
 	}
 	defer file.Close()
 
-	err = download.Download(client, torrentData, file)
+	session, err := download.NewSession(torrentData, file)
+	if err != nil {
+		return err
+	}
+
+	err = downloadFromPeers(response.Peers, local, len(torrentData.Pieces), session)
 	if err != nil {
 		return err
 	}
@@ -135,15 +111,89 @@ func run() error {
 	return nil
 }
 
-func connectToPeer(addrs []net.TCPAddr, local peer.Handshake) (net.Conn, *peer.Handshake, error) {
-	for _, addr := range addrs {
-		conn, received, err := peer.Connect(addr, local)
-		if err != nil {
-			log.Printf("error at addr %s: %s", &addr, err)
-		} else {
-			return conn, received, err
+func preparePeer(addr net.TCPAddr, local peer.Handshake, pieceCount int) (*peer.Client, error) {
+	conn, received, err := peer.Connect(addr, local)
+	if err != nil {
+		return nil, &download.PeerError{
+			Op:  fmt.Sprintf("connect to peer at addr %s", addr.String()),
+			Err: err,
 		}
 	}
 
-	return nil, nil, fmt.Errorf("no successful connection with peers")
+	log.Printf("recieved peerID: %x", received.PeerID)
+
+	client, err := peer.NewClient(conn, *received, pieceCount)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	err = client.Conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if err != nil {
+		conn.Close()
+		return nil, &download.PeerError{
+			Op:  "set unchoke deadline",
+			Err: err,
+		}
+	}
+	err = client.WaitForUnchoke()
+	if err != nil {
+		conn.Close()
+		return nil, &download.PeerError{
+			Op:  "wait for unchoke",
+			Err: err,
+		}
+	}
+	err = client.Conn.SetDeadline(time.Time{})
+	if err != nil {
+		conn.Close()
+		return nil, &download.PeerError{
+			Op:  "clear unchoke deadline",
+			Err: err,
+		}
+	}
+
+	return client, nil
+}
+
+func downloadFromPeers(
+	addrs []net.TCPAddr,
+	local peer.Handshake,
+	pieceCount int,
+	session *download.Session,
+) error {
+	if session.Complete() {
+		return nil
+	}
+
+	var peerErr *download.PeerError
+	for _, addr := range addrs {
+		client, err := preparePeer(addr, local, pieceCount)
+		if err != nil {
+			retryable := errors.As(err, &peerErr)
+			if retryable {
+				log.Printf("error preparing peer %s: %s", addr.String(), err)
+				continue
+			} else {
+				return err
+			}
+		}
+
+		err = session.DownloadFrom(client)
+		client.Conn.Close()
+		if err != nil {
+			retryable := errors.As(err, &peerErr)
+			if retryable {
+				log.Printf("download from peer %s failed: %s", addr.String(), err)
+			} else {
+				return err
+			}
+		}
+
+		if session.Complete() {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("exhausted peers before session completed")
 }

@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"fmt"
+	"github.com/lorithan/torrent-client/internal/download"
+	"github.com/lorithan/torrent-client/internal/torrent"
 	"io"
 	"net"
 	"testing"
@@ -60,64 +63,79 @@ func startSelectionTestPeer(t *testing.T, local, remote peer.Handshake, reject b
 	return *listener.Addr().(*net.TCPAddr), done
 }
 
-func TestConnectToPeerRetriesAfterHandshakeFailure(t *testing.T) {
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("connection failure panicked instead of trying next peer: %v", r)
+func TestDownloadFromPeersRetriesAfterHandshakeFailure(t *testing.T) {
+	local := peer.Handshake{InfoHash: [20]byte{1}}
+	bad, badDone := startSelectionTestPeer(t, local, local, true)
+	good, goodDone := startFallbackTestPeer(t, local, func(conn net.Conn) error {
+		for _, index := range []uint32{0, 1} {
+			if err := fallbackTestRequest(conn, index); err != nil {
+				return err
+			}
+			if err := fallbackTestReply(conn, index, []byte("data")); err != nil {
+				return err
+			}
+			if err := fallbackTestHave(conn, index); err != nil {
+				return err
+			}
 		}
-	}()
-	local := peer.Handshake{InfoHash: [20]byte{1, 2, 3}, PeerID: [20]byte{'l'}}
-	remote := peer.Handshake{InfoHash: local.InfoHash, PeerID: [20]byte{'r'}}
-	bad, badDone := startSelectionTestPeer(t, local, remote, true)
-	good, goodDone := startSelectionTestPeer(t, local, remote, false)
-	conn, got, err := connectToPeer([]net.TCPAddr{bad, good}, local)
-	if conn != nil {
-		t.Cleanup(func() { conn.Close() })
-	}
-	if err != nil || conn == nil || got == nil || *got != remote {
-		t.Fatalf("got (%v, %+v, %v), want successful second peer", conn, got, err)
-	}
-	if conn.RemoteAddr().String() != good.String() {
-		t.Errorf("connected to %s, want %s", conn.RemoteAddr(), good.String())
-	}
-	if err := conn.Close(); err != nil {
+		var next [1]byte
+		if _, err := conn.Read(next[:]); err != io.EOF {
+			return fmt.Errorf("expected cleanup, got %v", err)
+		}
+		return nil
+	})
+	hash := sha1.Sum([]byte("data"))
+	tf := &torrent.TorrentFile{Length: 8, PieceLength: 4, Pieces: [][20]byte{hash, hash}}
+	dst := &fallbackTestWriter{data: make([]byte, 8)}
+	session, err := download.NewSession(tf, dst)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if err := downloadFromPeers([]net.TCPAddr{bad, good}, local, 2, session); err != nil {
+		t.Fatal(err)
+	}
+	if !session.Complete() || !bytes.Equal(dst.data, []byte("datadata")) {
+		t.Error("second peer did not complete output")
+	}
 	if err := <-badDone; err != nil {
-		t.Errorf("failed peer: %v", err)
+		t.Error(err)
 	}
 	if err := <-goodDone; err != nil {
-		t.Errorf("successful peer: %v", err)
+		t.Error(err)
 	}
 }
 
-func TestConnectToPeerAllFail(t *testing.T) {
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("connection failures panicked instead of returning an error: %v", r)
-		}
-	}()
+func TestDownloadFromPeersAllPreparationsFail(t *testing.T) {
 	local := peer.Handshake{InfoHash: [20]byte{1}}
 	first, firstDone := startSelectionTestPeer(t, local, local, true)
 	second, secondDone := startSelectionTestPeer(t, local, local, true)
-	conn, got, err := connectToPeer([]net.TCPAddr{first, second}, local)
-	if conn != nil {
-		defer conn.Close()
+	tf := &torrent.TorrentFile{Length: 4, PieceLength: 4, Pieces: make([][20]byte, 1)}
+	dst := &fallbackTestWriter{data: make([]byte, 4)}
+	session, err := download.NewSession(tf, dst)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if conn != nil || got != nil || err == nil {
-		t.Fatalf("got (%v, %+v, %v), want nil connection, nil handshake, error", conn, got, err)
+	if err := downloadFromPeers([]net.TCPAddr{first, second}, local, 1, session); err == nil {
+		t.Error("expected peer exhaustion error")
+	}
+	if session.Complete() || dst.calls != 0 {
+		t.Error("failed preparation changed output or progress")
 	}
 	if err := <-firstDone; err != nil {
-		t.Errorf("first peer: %v", err)
+		t.Error(err)
 	}
 	if err := <-secondDone; err != nil {
-		t.Errorf("second peer: %v", err)
+		t.Error(err)
 	}
 }
 
-func TestConnectToPeerEmpty(t *testing.T) {
-	conn, got, err := connectToPeer(nil, peer.Handshake{})
-	if conn != nil || got != nil || err == nil {
-		t.Errorf("got (%v, %+v, %v), want nil connection, nil handshake, error", conn, got, err)
+func TestDownloadFromPeersNoAddressesWhileIncomplete(t *testing.T) {
+	tf := &torrent.TorrentFile{Length: 4, PieceLength: 4, Pieces: make([][20]byte, 1)}
+	session, err := download.NewSession(tf, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := downloadFromPeers(nil, peer.Handshake{}, 1, session); err == nil {
+		t.Error("expected peer exhaustion error")
 	}
 }

@@ -28,6 +28,9 @@ func TestSessionDownloadFromRetainsProgressAfterInterruptedPiece(t *testing.T) {
 	if s.completedCount != 1 || !s.completed.HasPiece(0) || s.completed.HasPiece(1) {
 		t.Fatalf("progress after failure = count %d, bitfield %x; want only piece zero complete", s.completedCount, s.completed)
 	}
+	if s.Complete() {
+		t.Error("session reported completion after an interrupted piece")
+	}
 	second, _, secondConn, _ := downloadFixture(t, 4, 10, -1)
 	secondConn.incoming = bytes.NewReader(allReplies[17:])
 	if err := s.DownloadFrom(second); err != nil {
@@ -45,6 +48,9 @@ func TestSessionDownloadFromRetainsProgressAfterInterruptedPiece(t *testing.T) {
 	}
 	if s.completedCount != 3 {
 		t.Errorf("completed count = %d, want 3", s.completedCount)
+	}
+	if !s.Complete() {
+		t.Error("session did not report completion after the second peer finished")
 	}
 	if len(dst.writes) != 3 {
 		t.Fatalf("writes = %d, want 3", len(dst.writes))
@@ -92,6 +98,9 @@ func TestSessionDownloadFromRetainsCommittedPieceOnHaveFailure(t *testing.T) {
 	if s.completedCount != 1 || !s.completed.HasPiece(0) || len(dst.writes) != 1 {
 		t.Error("announcement failure lost the successfully stored piece")
 	}
+	if !s.Complete() {
+		t.Error("final announcement failure hid successful file completion")
+	}
 	if err := s.DownloadFrom(nil); err != nil {
 		t.Errorf("completed session should not redownload: %v", err)
 	}
@@ -115,6 +124,9 @@ func TestSessionDownloadFromDoesNotCommitFailedWrite(t *testing.T) {
 	}
 	if s.completedCount != 0 || s.completed.HasPiece(0) {
 		t.Error("failed output write committed progress")
+	}
+	if s.Complete() {
+		t.Error("failed storage write was reported as a completed download")
 	}
 	if conn.outgoing.Len() != 17 {
 		t.Error("failed output write announced completion")

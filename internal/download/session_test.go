@@ -36,6 +36,9 @@ func TestNewSession(t *testing.T) {
 			if s.completedCount != 0 || !bytes.Equal(s.completed, make([]byte, tt.bitfieldBytes)) {
 				t.Errorf("initial progress = %d completed, bitfield %x; want zero completed and %d zero bytes", s.completedCount, s.completed, tt.bitfieldBytes)
 			}
+			if got := s.Complete(); got != (tt.pieces == 0) {
+				t.Errorf("new session Complete() = %v, want %v", got, tt.pieces == 0)
+			}
 			if err := s.completed.Validate(tt.pieces); err != nil {
 				t.Errorf("invalid initial completion bitfield: %v", err)
 			}

@@ -135,3 +135,7 @@ func (s *Session) DownloadFrom(client *peer.Client) error {
 
 	return nil
 }
+
+func (s *Session) Complete() bool {
+	return s.completedCount == len(s.torrent.Pieces)
+}
