@@ -49,8 +49,8 @@ func SelectPiece(available, completed peer.Bitfield, pieceCount int) (int, bool)
 	return 0, false
 }
 
-func DownloadPiece(client *peer.Client, tf *torrent.TorrentFile, index int) ([]byte, error) {
-	pieceSize, err := PieceSize(tf, index)
+func (s *Session) DownloadPiece(client *peer.Client, index int) ([]byte, error) {
+	pieceSize, err := PieceSize(s.torrent, index)
 	if err != nil {
 		return nil, err
 	}
@@ -85,13 +85,15 @@ func DownloadPiece(client *peer.Client, tf *torrent.TorrentFile, index int) ([]b
 			}
 		}
 
+		s.stats.Downloaded += int64(len(block))
+
 		piece = append(piece, block...)
 		offset += int64(len(block))
 	}
 
 	hash := sha1.Sum(piece)
 
-	if hash != tf.Pieces[index] {
+	if hash != s.torrent.Pieces[index] {
 		return nil, &PeerError{
 			Op:  fmt.Sprintf("verify piece %d", index),
 			Err: fmt.Errorf("piece %d hash does not match expected hash", index),

@@ -36,6 +36,9 @@ func TestSessionDownloadFromRetainsProgressAfterInterruptedPiece(t *testing.T) {
 	if s.Complete() {
 		t.Error("session reported completion after an interrupted piece")
 	}
+	if got := s.Stats().Left; got != 6 {
+		t.Errorf("Left after interrupted piece = %d, want 6", got)
+	}
 	second, _, secondConn, _ := downloadFixture(t, 4, 10, -1)
 	secondConn.incoming = bytes.NewReader(allReplies[17:])
 	if err := s.DownloadFrom(second); err != nil {
@@ -57,6 +60,9 @@ func TestSessionDownloadFromRetainsProgressAfterInterruptedPiece(t *testing.T) {
 	if !s.Complete() {
 		t.Error("session did not report completion after the second peer finished")
 	}
+	if got := s.Stats().Left; got != 0 {
+		t.Errorf("Left after completing the short final piece = %d, want 0", got)
+	}
 	if len(dst.writes) != 3 {
 		t.Fatalf("writes = %d, want 3", len(dst.writes))
 	}
@@ -71,6 +77,9 @@ func TestSessionDownloadFromRetainsProgressAfterInterruptedPiece(t *testing.T) {
 	}
 	if len(dst.writes) != 3 {
 		t.Error("completed session wrote pieces again")
+	}
+	if got := s.Stats().Left; got != 0 {
+		t.Errorf("reusing completed session changed Left to %d", got)
 	}
 }
 
@@ -93,6 +102,12 @@ func TestSessionDownloadFromRetainsCommittedPieceOnHaveFailure(t *testing.T) {
 	}
 	if !s.Complete() {
 		t.Error("final announcement failure hid successful file completion")
+	}
+	if got := s.Stats().Left; got != 0 {
+		t.Errorf("announcement failure left %d bytes remaining for a committed file", got)
+	}
+	if got := s.Stats().Downloaded; got != tf.Length {
+		t.Errorf("announcement failure lost received payload count: got %d, want %d", got, tf.Length)
 	}
 	if err := s.DownloadFrom(nil); err != nil {
 		t.Errorf("completed session should not redownload: %v", err)
@@ -121,8 +136,51 @@ func TestSessionDownloadFromDoesNotCommitFailedWrite(t *testing.T) {
 	if s.Complete() {
 		t.Error("failed storage write was reported as a completed download")
 	}
+	if got := s.Stats().Left; got != tf.Length {
+		t.Errorf("failed storage write changed Left to %d, want %d", got, tf.Length)
+	}
+	if got := s.Stats().Downloaded; got != tf.Length {
+		t.Errorf("failed storage write lost received payload count: got %d, want %d", got, tf.Length)
+	}
 	if conn.outgoing.Len() != 17 {
 		t.Error("failed output write announced completion")
+	}
+}
+
+func TestSessionLeftPreservesProgressAfterCorruption(t *testing.T) {
+	bad, tf, _, _ := downloadFixture(t, 4, 10, 1)
+	dst := &downloadTestWriter{}
+	s, err := NewSession(tf, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var peerErr *PeerError
+	err = s.DownloadFrom(bad)
+	if !errors.As(err, &peerErr) || peerErr.Op != "verify piece 1" {
+		t.Fatalf("error = %v, want corrupt second piece", err)
+	}
+	if got := s.Stats().Left; got != 6 {
+		t.Errorf("corrupt piece reduced Left to %d, want 6", got)
+	}
+	if got := s.Stats().Downloaded; got != 8 {
+		t.Errorf("corrupt piece was omitted from transferred bytes: got %d, want 8", got)
+	}
+	good, _, conn, _ := downloadFixture(t, 4, 10, -1)
+	// The replacement supplies only pieces one and two; piece zero is committed.
+	if _, err := conn.incoming.Seek(17, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DownloadFrom(good); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Stats().Left; got != 0 {
+		t.Errorf("Left after replacement = %d, want 0", got)
+	}
+	if got := s.Stats().Downloaded; got != 14 {
+		t.Errorf("received bytes after retry = %d, want 14 (including the corrupt attempt)", got)
+	}
+	if len(dst.writes) != 3 {
+		t.Errorf("writes = %d, want each of three pieces committed once", len(dst.writes))
 	}
 }
 
@@ -274,6 +332,9 @@ func TestNewSession(t *testing.T) {
 			if got := s.Complete(); got != (tt.pieces == 0) {
 				t.Errorf("new session Complete() = %v, want %v", got, tt.pieces == 0)
 			}
+			if got, want := s.Stats(), (Stats{Left: tt.length}); got != want {
+				t.Errorf("initial stats = %+v, want %+v", got, want)
+			}
 			if err := s.completed.Validate(tt.pieces); err != nil {
 				t.Errorf("invalid initial completion bitfield: %v", err)
 			}
@@ -281,6 +342,30 @@ func TestNewSession(t *testing.T) {
 				t.Error("constructor wrote output before downloading anything")
 			}
 		})
+	}
+}
+
+func TestSessionStatsReturnsSnapshot(t *testing.T) {
+	tf := &torrent.TorrentFile{Length: 4, PieceLength: 4, Pieces: make([][20]byte, 1)}
+	s, err := NewSession(tf, &downloadTestWriter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := s.Stats()
+	changed := original
+	changed.Uploaded = 123
+	changed.Left = 0
+	if got := s.Stats(); got != original {
+		t.Errorf("changing a snapshot changed the session: %+v", got)
+	}
+	// Snapshots already returned to a caller must not become live views of the
+	// session when its counters change later.
+	s.stats.Uploaded = 10
+	if original.Uploaded != 0 {
+		t.Error("session changes mutated an earlier snapshot")
+	}
+	if got := s.Stats(); got.Uploaded != 10 {
+		t.Error("accessor did not return current statistics")
 	}
 }
 

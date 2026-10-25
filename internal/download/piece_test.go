@@ -51,7 +51,11 @@ func TestDownloadPieceRejectsCorruptedData(t *testing.T) {
 			if err := client.Bitfield.SetPiece(1); err != nil {
 				t.Fatal(err)
 			}
-			got, err := DownloadPiece(client, tf, 1)
+			session, err := NewSession(tf, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := session.DownloadPiece(client, 1)
 			if err == nil || got != nil {
 				t.Fatalf("got %d bytes and error %v, want nil data and hash error", len(got), err)
 			}
@@ -60,6 +64,9 @@ func TestDownloadPieceRejectsCorruptedData(t *testing.T) {
 			}
 			if conn.incoming.Len() != 0 || conn.outgoing.Len() != 34 {
 				t.Error("hash check did not follow the complete two-block transfer")
+			}
+			if stats := session.Stats(); stats.Downloaded != int64(len(original)) || stats.Left != tf.Length {
+				t.Errorf("corrupt-piece stats = %+v, want downloaded %d with Left unchanged", stats, len(original))
 			}
 		})
 	}
@@ -106,7 +113,11 @@ func TestDownloadPieceBlocks(t *testing.T) {
 			if err := client.Bitfield.SetPiece(tt.index); err != nil {
 				t.Fatal(err)
 			}
-			got, err := DownloadPiece(client, tf, tt.index)
+			session, err := NewSession(tf, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := session.DownloadPiece(client, tt.index)
 			if !bytes.Equal(conn.outgoing.Bytes(), wantRequests) {
 				t.Errorf("requests = %x, want %x", conn.outgoing.Bytes(), wantRequests)
 			}
@@ -118,6 +129,9 @@ func TestDownloadPieceBlocks(t *testing.T) {
 			}
 			if conn.incoming.Len() != 0 {
 				t.Errorf("left %d response bytes unread", conn.incoming.Len())
+			}
+			if stats := session.Stats(); stats.Downloaded != int64(len(data)) || stats.Left != tf.Length {
+				t.Errorf("piece stats = %+v, want downloaded %d and Left unchanged until written", stats, len(data))
 			}
 		})
 	}
@@ -144,7 +158,11 @@ func TestDownloadPieceClassifiesPeerFailures(t *testing.T) {
 			conn := &pieceErrorTestConn{reader: tt.reader}
 			client := &peer.Client{Conn: conn, Choked: tt.choked, PieceCount: 1, Bitfield: peer.Bitfield{0x80}}
 			tf := &torrent.TorrentFile{Length: 4, PieceLength: 4, Pieces: [][20]byte{sha1.Sum([]byte("data"))}}
-			got, err := DownloadPiece(client, tf, 0)
+			session, err := NewSession(tf, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := session.DownloadPiece(client, 0)
 			var classified *PeerError
 			if got != nil || !errors.As(err, &classified) {
 				t.Fatalf("got (%x, %v), want nil data and PeerError", got, err)
@@ -183,7 +201,10 @@ func TestDownloadPieceDoesNotClassifyInvalidMetadataAsPeerFailure(t *testing.T) 
 		t.Run(tt.name, func(t *testing.T) {
 			tf := &torrent.TorrentFile{Length: tt.length, PieceLength: tt.pieceLength, Pieces: make([][20]byte, 1)}
 			// A nil client proves local validation fails before accessing a peer.
-			got, err := DownloadPiece(nil, tf, tt.index)
+			// Bypass the constructor only to exercise the method's local validation
+			// with deliberately invalid metadata, before any peer operations.
+			session := &Session{torrent: tf}
+			got, err := session.DownloadPiece(nil, tt.index)
 			if got != nil || err == nil {
 				t.Fatalf("got (%x, %v), want nil data and validation error", got, err)
 			}

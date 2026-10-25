@@ -10,11 +10,18 @@ import (
 	"github.com/lorithan/torrent-client/internal/torrent"
 )
 
+type Stats struct {
+	Uploaded   int64
+	Downloaded int64
+	Left       int64
+}
+
 type Session struct {
 	torrent        *torrent.TorrentFile
 	dest           io.WriterAt
 	completed      peer.Bitfield
 	completedCount int
+	stats          Stats
 }
 
 func NewSession(tf *torrent.TorrentFile, dst io.WriterAt) (*Session, error) {
@@ -45,11 +52,16 @@ func NewSession(tf *torrent.TorrentFile, dst io.WriterAt) (*Session, error) {
 	completed := make(peer.Bitfield, requiredBytes)
 	completedCount := 0
 
+	stats := Stats{
+		Left: tf.Length,
+	}
+
 	return &Session{
 		torrent:        tf,
 		dest:           dst,
 		completed:      completed,
 		completedCount: completedCount,
+		stats:          stats,
 	}, nil
 }
 
@@ -91,7 +103,7 @@ func (s *Session) DownloadFrom(client *peer.Client) error {
 			}
 		}
 
-		piece, err := DownloadPiece(client, s.torrent, index)
+		piece, err := s.DownloadPiece(client, index)
 		if err != nil {
 			return err
 		}
@@ -106,6 +118,8 @@ func (s *Session) DownloadFrom(client *peer.Client) error {
 			return err
 		}
 		s.completedCount++
+
+		s.stats.Left -= int64(len(piece))
 
 		message := peer.NewHave(uint32(index))
 		err = client.Conn.SetDeadline(time.Now().Add(30 * time.Second))
@@ -138,4 +152,8 @@ func (s *Session) DownloadFrom(client *peer.Client) error {
 
 func (s *Session) Complete() bool {
 	return s.completedCount == len(s.torrent.Pieces)
+}
+
+func (s *Session) Stats() Stats {
+	return s.stats
 }
