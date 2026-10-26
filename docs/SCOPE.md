@@ -35,7 +35,11 @@ The implementation currently provides:
 
 - Bencode decoding and single-file torrent parsing, including an info hash derived
   from the original encoded info dictionary bytes.
-- Initial HTTP/HTTPS tracker announces and compact IPv4 peer-list parsing.
+- HTTP/HTTPS tracker announces and compact and dictionary IPv4 peer-list parsing.
+- Periodic announces with current session statistics and started, completed, and
+  stopped lifecycle events. Requested rediscovery shares the same announce worker.
+- A synchronized peer queue and bounded discovery waits, with an announce
+  cooldown and a three-round rediscovery budget reset by verified progress.
 - A session peer ID and an OS-selected or explicitly requested listening port.
 - Outgoing TCP connections, handshakes, and trying another address when initial
   connection or handshake attempts fail.
@@ -43,20 +47,26 @@ The implementation currently provides:
 - One outstanding block request at a time on one peer connection.
 - Selection of advertised, unfinished pieces and writes at their file offsets.
 - Piece SHA-1 verification before writing or announcing completion.
+- Session-owned completed-piece tracking and sequential replacement of failed
+  peers, preserving verified output and retrying interrupted or corrupt pieces.
 - Separate deadlines for waiting for availability, requesting blocks, and sending
   completion announcements.
 - A CLI with explicit torrent/output paths and refusal to overwrite existing
   output files.
 
 Tests exercise complete downloads using local fake trackers and peers, output
-protection, invalid data, and several failure paths. Manual testing has shown
+protection, invalid data, lifecycle ordering, bounded rediscovery, and several
+failure paths. A combined recovery test verifies that a tracker-discovered
+replacement finishes an interrupted transfer without requesting a completed
+piece again. Manual testing has shown
 sustained downloads from a real swarm; that does not establish successful
 completion of the large real-world torrent tested.
 
 The current listener reserves an incoming port but does not accept and serve
-incoming peers. Uploading, seeding, periodic tracker updates, a TUI, and replacing
-a peer after a transfer failure remain unfinished. Current progress tracking is
-local to the single-peer download operation.
+incoming peers. Simultaneous peer downloads, uploading, seeding, and a TUI remain
+unfinished. Cancellation interrupts discovery waits and worker cooldowns;
+in-flight tracker HTTP calls and peer operations still rely on their timeouts
+rather than immediate context cancellation.
 
 ## First-release features and acceptance criteria
 
@@ -237,6 +247,7 @@ Before adding a deferred feature, explicitly decide whether it is required for
 this release or belongs to a later milestone, and update this document. Avoid
 expanding the current task merely because an extension would be useful.
 
-The immediate next implementation milestone is session progress plus sequential
-peer fallback. This is a stepping
-stone toward simultaneous peers, not the final release architecture.
+Session progress, sequential fallback, and tracker lifecycle/rediscovery are
+implemented. The next implementation milestone is concurrent peer scheduling:
+bounded workers, explicit piece assignments, and coordinated completion and
+output accounting.

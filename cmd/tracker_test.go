@@ -129,6 +129,122 @@ func TestRunDiscoversPeerAfterEmptyInitialAnnounce(t *testing.T) {
 	}
 }
 
+func TestRunRediscoversPeerAfterTransferFailure(t *testing.T) {
+	firstHash, secondHash := sha1.Sum([]byte("abcd")), sha1.Sum([]byte("efgh"))
+	info := "d6:lengthi8e4:name8:file.bin12:piece lengthi4e6:pieces40:" + string(firstHash[:]) + string(secondHash[:]) + "e"
+	local := peer.Handshake{InfoHash: sha1.Sum([]byte(info))}
+	announcedIDs := make(chan string, 2)
+	verify := func(wire [68]byte) error {
+		select {
+		case id := <-announcedIDs:
+			if !bytes.Equal(wire[28:48], local.InfoHash[:]) || string(wire[48:]) != id {
+				return errors.New("peer handshake differs from announced torrent or session identity")
+			}
+		default:
+			return errors.New("peer connected before the started announce")
+		}
+		return nil
+	}
+	first, firstDone := startFallbackTestPeerWithVerifier(t, local, func(conn net.Conn) error {
+		if err := fallbackTestRequest(conn, 0); err != nil {
+			return err
+		}
+		if err := fallbackTestReply(conn, 0, []byte("abcd")); err != nil {
+			return err
+		}
+		if err := fallbackTestHave(conn, 0); err != nil {
+			return err
+		}
+		if err := fallbackTestRequest(conn, 1); err != nil {
+			return err
+		}
+		// Disconnect halfway through the second piece's advertised response.
+		return fallbackTestReply(conn, 1, []byte("ef"))
+	}, verify, 10*time.Second)
+	second, secondDone := startFallbackTestPeerWithVerifier(t, local, func(conn net.Conn) error {
+		// Requesting piece zero again is a failure: it is already verified on disk.
+		if err := fallbackTestRequest(conn, 1); err != nil {
+			return err
+		}
+		if err := fallbackTestReply(conn, 1, []byte("efgh")); err != nil {
+			return err
+		}
+		if err := fallbackTestHave(conn, 1); err != nil {
+			return err
+		}
+		return fallbackTestExpectClosed(conn)
+	}, verify, 10*time.Second)
+	dir := t.TempDir()
+	torrentPath, outputPath := filepath.Join(dir, "input.torrent"), filepath.Join(dir, "output.bin")
+	compact := binary.BigEndian.AppendUint16([]byte{127, 0, 0, 1}, uint16(first.Port))
+	requests := make(chan url.Values, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		requests <- q
+		switch q.Get("event") {
+		case "started":
+			announcedIDs <- q.Get("peer_id")
+			announcedIDs <- q.Get("peer_id")
+			_, _ = fmt.Fprintf(w, "d8:intervali1800e5:peers6:%se", string(compact))
+		case "":
+			data, err := os.ReadFile(outputPath)
+			if err != nil || !bytes.Equal(data, []byte("abcd")) {
+				t.Errorf("output at rediscovery = %q, error %v; want verified first piece", data, err)
+			}
+			// Exercise dictionary peers through HTTP as well as the parser tests.
+			_, _ = fmt.Fprintf(w, "d8:intervali1800e5:peersld2:ip9:127.0.0.14:porti%deeee", second.Port)
+		default:
+			_, _ = io.WriteString(w, "d8:intervali1800e5:peers0:e")
+		}
+	}))
+	t.Cleanup(server.Close)
+	meta := fmt.Appendf(nil, "d8:announce%d:%s4:info%se", len(server.URL), server.URL, info)
+	if err := os.WriteFile(torrentPath, meta, 0600); err != nil {
+		t.Fatal(err)
+	}
+	prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
+	if err := run(10 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	for _, done := range []<-chan error{firstDone, secondDone} {
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}
+	data, err := os.ReadFile(outputPath)
+	if err != nil || !bytes.Equal(data, []byte("abcdefgh")) {
+		t.Fatalf("output = %q, error %v; want abcdefgh", data, err)
+	}
+	if len(requests) != 4 {
+		t.Fatalf("announces = %d, want 4", len(requests))
+	}
+	var started url.Values
+	for _, event := range []string{"started", "", "completed", "stopped"} {
+		q := <-requests
+		if q.Get("event") != event {
+			t.Errorf("event = %q, want %q", q.Get("event"), event)
+		}
+		if event == "started" {
+			started = q
+		}
+		for _, key := range []string{"peer_id", "info_hash", "port"} {
+			if q.Get(key) != started.Get(key) {
+				t.Errorf("%s changed during recovery", key)
+			}
+		}
+		left, downloaded := "8", "0"
+		if event == "" {
+			left, downloaded = "4", "4"
+		}
+		if event == "completed" || event == "stopped" {
+			left, downloaded = "0", "8"
+		}
+		if q.Get("left") != left || q.Get("downloaded") != downloaded || q.Get("uploaded") != "0" {
+			t.Errorf("event %q: counters = %s/%s/%s; want uploaded/ downloaded/left = 0/%s/%s", event, q.Get("uploaded"), q.Get("downloaded"), q.Get("left"), downloaded, left)
+		}
+	}
+}
+
 func TestRunJoinsPeriodicAnnounceBeforeLifecycleEvents(t *testing.T) {
 	firstHash, secondHash := sha1.Sum([]byte("abcd")), sha1.Sum([]byte("efgh"))
 	info := "d6:lengthi8e4:name8:file.bin12:piece lengthi4e6:pieces40:" + string(firstHash[:]) + string(secondHash[:]) + "e"
