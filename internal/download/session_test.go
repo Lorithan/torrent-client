@@ -7,8 +7,10 @@ import (
 	"io"
 	"math"
 	"net"
+	"sync"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/lorithan/torrent-client/internal/peer"
 	"github.com/lorithan/torrent-client/internal/torrent"
@@ -360,12 +362,86 @@ func TestSessionStatsReturnsSnapshot(t *testing.T) {
 	}
 	// Snapshots already returned to a caller must not become live views of the
 	// session when its counters change later.
+	s.statsMu.Lock()
 	s.stats.Uploaded = 10
+	s.statsMu.Unlock()
 	if original.Uploaded != 0 {
 		t.Error("session changes mutated an earlier snapshot")
 	}
 	if got := s.Stats(); got.Uploaded != 10 {
 		t.Error("accessor did not return current statistics")
+	}
+}
+
+func TestSessionStatsDuringTransfer(t *testing.T) {
+	client, tf, conn, _ := downloadFixture(t, 4096, 128*4096+17, -1)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	client.Conn = &statsGateConn{pieceTestConn: conn, entered: entered, release: release}
+	s, err := NewSession(tf, &downloadTestWriter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transferDone := make(chan error, 1)
+	go func() { transferDone <- s.DownloadFrom(client) }()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("transfer did not reach the network read")
+	}
+	// A stalled network operation must not prevent a tracker worker from reading
+	// statistics. This also catches holding the mutex across peer I/O.
+	snapshot := make(chan Stats, 1)
+	go func() { snapshot <- s.Stats() }()
+	select {
+	case got := <-snapshot:
+		if got != (Stats{Left: tf.Length}) {
+			t.Errorf("stats before first payload = %+v", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stats blocked behind network I/O")
+	}
+	stop, started := make(chan struct{}), make(chan struct{})
+	var stopOnce sync.Once
+	stopObserver := func() { stopOnce.Do(func() { close(stop) }) }
+	defer stopObserver()
+	observed := make(chan error, 1)
+	go func() {
+		previous := s.Stats()
+		close(started)
+		for {
+			select {
+			case <-stop:
+				observed <- nil
+				return
+			default:
+				current := s.Stats()
+				if current.Downloaded < previous.Downloaded || current.Left > previous.Left || current.Left < 0 || current.Left > tf.Length || current.Uploaded != 0 {
+					observed <- fmt.Errorf("inconsistent snapshots: previous %+v, current %+v", previous, current)
+					return
+				}
+				previous = current
+			}
+		}
+	}()
+	<-started
+	unblock()
+	select {
+	case err := <-transferDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("transfer blocked during concurrent statistics reads")
+	}
+	stopObserver()
+	if err := <-observed; err != nil {
+		t.Error(err)
+	}
+	if got, want := s.Stats(), (Stats{Downloaded: tf.Length}); got != want {
+		t.Errorf("final stats = %+v, want %+v", got, want)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,6 +56,19 @@ type pieceTestConn struct {
 	net.Conn
 	incoming *bytes.Reader
 	outgoing bytes.Buffer
+}
+
+// Hold the first peer read until the test has checked a concurrent snapshot.
+type statsGateConn struct {
+	*pieceTestConn
+	once    sync.Once
+	entered chan struct{}
+	release <-chan struct{}
+}
+
+func (c *statsGateConn) Read(p []byte) (int, error) {
+	c.once.Do(func() { close(c.entered); <-c.release })
+	return c.pieceTestConn.Read(p)
 }
 
 func (c *pieceTestConn) SetDeadline(time.Time) error { return nil }

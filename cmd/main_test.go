@@ -114,13 +114,19 @@ func TestRunContinuesWithSecondPeer(t *testing.T) {
 	if !bytes.Equal(got, []byte("abcdefgh")) {
 		t.Errorf("saved %q, want abcdefgh", got)
 	}
-	if len(lifecycle) != 2 {
-		t.Fatalf("announce count = %d, want started and completed", len(lifecycle))
+	if len(lifecycle) != 3 {
+		t.Fatalf("announce count = %d, want started, completed, and stopped", len(lifecycle))
 	}
 	started, completed := <-lifecycle, <-lifecycle
 	for key, want := range map[string]string{"event": "completed", "uploaded": "0", "downloaded": "8", "left": "0", "peer_id": started.Get("peer_id"), "port": started.Get("port"), "info_hash": started.Get("info_hash")} {
 		if got := completed.Get(key); got != want {
 			t.Errorf("completion query[%q] = %q, want %q", key, got, want)
+		}
+	}
+	stopped := <-lifecycle
+	for key, want := range map[string]string{"event": "stopped", "uploaded": "0", "downloaded": "8", "left": "0", "peer_id": started.Get("peer_id"), "port": started.Get("port"), "info_hash": started.Get("info_hash")} {
+		if got := stopped.Get(key); got != want {
+			t.Errorf("stopped query[%q] = %q, want %q", key, got, want)
 		}
 	}
 }
@@ -148,14 +154,16 @@ func prepareRun(t *testing.T, args ...string) *bytes.Buffer {
 }
 
 func TestRunDownload(t *testing.T) {
-	for _, scenario := range []string{"success", "completion tracker failure", "existing output", "corrupted data", "peer disconnect"} {
+	for _, scenario := range []string{"success", "completion tracker failure", "stopped tracker failure", "corrupted data", "corrupt and stopped failures", "peer disconnect"} {
 		t.Run(scenario, func(t *testing.T) { runDownloadScenario(t, scenario) })
 	}
 }
 
 func runDownloadScenario(t *testing.T, scenario string) {
 	t.Helper()
-	successful := scenario == "success" || scenario == "completion tracker failure"
+	successful := scenario == "success" || scenario == "completion tracker failure" || scenario == "stopped tracker failure"
+	corrupted := scenario == "corrupted data" || scenario == "corrupt and stopped failures"
+	stopFailure := scenario == "stopped tracker failure" || scenario == "corrupt and stopped failures"
 	contents := []byte("data")
 	pieceHash := sha1.Sum(contents)
 	info := "d6:lengthi4e4:name8:file.bin12:piece lengthi4e6:pieces20:" + string(pieceHash[:]) + "e"
@@ -238,7 +246,7 @@ func runDownloadScenario(t *testing.T, scenario string) {
 				return
 			}
 			blockData := append([]byte(nil), contents...)
-			if scenario == "corrupted data" {
+			if corrupted {
 				blockData[0] ^= 0xff
 			}
 			block := append([]byte{0, 0, 0, 13, 7, 0, 0, 0, 0, 0, 0, 0, 0}, blockData...)
@@ -280,6 +288,11 @@ func runDownloadScenario(t *testing.T, scenario string) {
 			_, _ = io.WriteString(w, "completion tracker unavailable")
 			return
 		}
+		if stopFailure && r.URL.Query().Get("event") == "stopped" {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, "stopped tracker unavailable")
+			return
+		}
 		_, _ = io.WriteString(w, "d8:intervali1800e5:peers6:"+string(compactPeer)+"e")
 	}))
 	t.Cleanup(server.Close)
@@ -317,7 +330,7 @@ func runDownloadScenario(t *testing.T, scenario string) {
 		if scenario == "existing output" && !os.IsExist(runErr) {
 			t.Errorf("expected file-exists error, got %v", runErr)
 		}
-		if scenario == "corrupted data" && (!strings.Contains(runErr.Error(), "exhausted peers") || !strings.Contains(output.String(), "hash")) {
+		if corrupted && (!strings.Contains(runErr.Error(), "exhausted peers") || !strings.Contains(output.String(), "hash")) {
 			t.Errorf("expected peer exhaustion with logged hash failure, got %v; logs %q", runErr, output.String())
 		}
 	}
@@ -370,6 +383,26 @@ func runDownloadScenario(t *testing.T, scenario string) {
 				t.Error("completion announce failure was not logged with its cause")
 			}
 		}
+		wantDownloaded, wantLeft := "4", "4"
+		if successful {
+			wantLeft = "0"
+		}
+		if scenario == "peer disconnect" {
+			wantDownloaded = "0"
+		}
+		select {
+		case stopped := <-requests:
+			for key, want := range map[string]string{"event": "stopped", "uploaded": "0", "downloaded": wantDownloaded, "left": wantLeft, "port": query.Get("port"), "peer_id": query.Get("peer_id"), "info_hash": query.Get("info_hash")} {
+				if got := stopped.Get(key); got != want {
+					t.Errorf("stopped query[%q] = %q, want %q", key, got, want)
+				}
+			}
+		default:
+			t.Error("tracker did not receive stopped announce")
+		}
+		if stopFailure && !strings.Contains(output.String(), "502") {
+			t.Error("stopped announce failure was not logged")
+		}
 		if len(requests) != 0 {
 			t.Error("unexpected extra lifecycle announce")
 		}
@@ -388,7 +421,7 @@ func runDownloadScenario(t *testing.T, scenario string) {
 		t.Fatal(err)
 	}
 	switch scenario {
-	case "success", "completion tracker failure":
+	case "success", "completion tracker failure", "stopped tracker failure":
 		if !bytes.Equal(saved, contents) {
 			t.Errorf("saved %q, want %q", saved, contents)
 		}
@@ -421,7 +454,9 @@ func TestRunTrackerFailures(t *testing.T) {
 		{"invalid response", http.StatusOK, "x"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			announces := make(chan string, 4)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				announces <- r.URL.Query().Get("event")
 				w.WriteHeader(tt.status)
 				_, _ = io.WriteString(w, tt.body)
 			}))
@@ -441,10 +476,43 @@ func TestRunTrackerFailures(t *testing.T) {
 			if tt.name == "tracker rejection" && !strings.Contains(err.Error(), "denied") {
 				t.Errorf("lost failure reason: %v", err)
 			}
-			if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
-				t.Errorf("tracker failure created output or stat failed: %v", err)
+			if len(announces) != 1 {
+				t.Errorf("initial announce failure caused %d tracker requests, want 1", len(announces))
+			}
+			if data, err := os.ReadFile(outputPath); err != nil || len(data) != 0 {
+				t.Errorf("tracker failure should retain the empty output created before announcing: bytes %d, error %v", len(data), err)
 			}
 		})
+	}
+}
+
+func TestRunExistingOutputDoesNotAnnounce(t *testing.T) {
+	requests := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- struct{}{}
+		_, _ = io.WriteString(w, "d8:intervali1800e5:peers0:e")
+	}))
+	t.Cleanup(server.Close)
+	dir := t.TempDir()
+	torrentPath, outputPath := filepath.Join(dir, "input.torrent"), filepath.Join(dir, "output.bin")
+	meta := fmt.Appendf(nil, "d8:announce%d:%s4:infod6:lengthi4e4:name8:file.bin12:piece lengthi4e6:pieces20:01234567890123456789ee", len(server.URL), server.URL)
+	if err := os.WriteFile(torrentPath, meta, 0600); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("preserve this existing file")
+	if err := os.WriteFile(outputPath, want, 0600); err != nil {
+		t.Fatal(err)
+	}
+	prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
+	if err := run(); !os.IsExist(err) {
+		t.Errorf("error = %v, want file-exists error", err)
+	}
+	if len(requests) != 0 {
+		t.Error("announced before validating output availability")
+	}
+	got, err := os.ReadFile(outputPath)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Errorf("existing output changed: %q, error %v", got, err)
 	}
 }
 
@@ -473,8 +541,8 @@ func TestRunNoPeers(t *testing.T) {
 			}
 			logs := prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
 			err := run()
-			if len(announces) != 1 {
-				t.Errorf("announce count = %d, want only started", len(announces))
+			if len(announces) != 2 {
+				t.Errorf("announce count = %d, want started and stopped", len(announces))
 			}
 			select {
 			case event := <-announces:
@@ -483,6 +551,14 @@ func TestRunNoPeers(t *testing.T) {
 				}
 			default:
 				t.Error("missing initial announce")
+			}
+			select {
+			case event := <-announces:
+				if event != "stopped" {
+					t.Errorf("final event = %q, want stopped", event)
+				}
+			default:
+				t.Error("missing stopped announce")
 			}
 			if empty {
 				if err != nil {

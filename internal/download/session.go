@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/lorithan/torrent-client/internal/peer"
@@ -16,12 +17,15 @@ type Stats struct {
 	Left       int64
 }
 
+// Session retains progress across sequential peer attempts. Stats may be called
+// during a transfer; other session operations still require a single owner.
 type Session struct {
 	torrent        *torrent.TorrentFile
 	dest           io.WriterAt
 	completed      peer.Bitfield
 	completedCount int
 	stats          Stats
+	statsMu        sync.Mutex // Protects stats, not the complete session state.
 }
 
 func NewSession(tf *torrent.TorrentFile, dst io.WriterAt) (*Session, error) {
@@ -119,7 +123,9 @@ func (s *Session) DownloadFrom(client *peer.Client) error {
 		}
 		s.completedCount++
 
+		s.statsMu.Lock()
 		s.stats.Left -= int64(len(piece))
+		s.statsMu.Unlock()
 
 		message := peer.NewHave(uint32(index))
 		err = client.Conn.SetDeadline(time.Now().Add(30 * time.Second))
@@ -154,6 +160,9 @@ func (s *Session) Complete() bool {
 	return s.completedCount == len(s.torrent.Pieces)
 }
 
+// Stats returns an independent snapshot without holding the lock after return.
 func (s *Session) Stats() Stats {
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
 	return s.stats
 }

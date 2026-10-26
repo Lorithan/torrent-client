@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -68,6 +69,18 @@ func run() error {
 	}
 
 	log.Printf("current addr: %d", addr.Port)
+
+	file, err := os.OpenFile(*output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	session, err := download.NewSession(torrentData, file)
+	if err != nil {
+		return err
+	}
+
 	peerID := tracker.GeneratePeerID()
 	httpClient := http.Client{
 		Timeout: 15 * time.Second,
@@ -85,6 +98,44 @@ func run() error {
 		return err
 	}
 
+	regularAnnounce := func() (*tracker.TrackerResponse, error) {
+		stats := session.Stats()
+		params := tracker.AnnounceParams{
+			Downloaded: stats.Downloaded,
+			Uploaded:   stats.Uploaded,
+			Left:       stats.Left,
+			Event:      tracker.AnnounceEventDefault,
+		}
+		return tracker.Announce(torrentData, peerID, uint16(addr.Port), &httpClient, params)
+
+	}
+
+	defer func() {
+		stats := session.Stats()
+		params := tracker.AnnounceParams{
+			Downloaded: stats.Downloaded,
+			Uploaded:   stats.Uploaded,
+			Left:       stats.Left,
+			Event:      tracker.AnnounceEventStopped,
+		}
+		_, err := tracker.Announce(torrentData, peerID, uint16(addr.Port), &httpClient, params)
+		if err != nil {
+			log.Printf("stopped announce error: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	updatesDone := make(chan struct{})
+	go func() {
+		defer close(updatesDone)
+		runTrackerUpdates(ctx, response.Interval, regularAnnounce)
+	}()
+	stopUpdates := func() {
+		cancel()
+		<-updatesDone
+	}
+	defer stopUpdates()
+
 	log.Printf("interval: %s, peers: %v", response.Interval, response.Peers)
 
 	local := peer.Handshake{
@@ -92,18 +143,8 @@ func run() error {
 		PeerID:   peerID,
 	}
 
-	file, err := os.OpenFile(*output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	session, err := download.NewSession(torrentData, file)
-	if err != nil {
-		return err
-	}
-
 	err = downloadFromPeers(response.Peers, local, len(torrentData.Pieces), session)
+	stopUpdates()
 	if err != nil {
 		return err
 	}
