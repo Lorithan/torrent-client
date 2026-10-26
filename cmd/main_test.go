@@ -98,7 +98,7 @@ func TestRunContinuesWithSecondPeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
-	if err := run(); err != nil {
+	if err := run(25 * time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-firstDone; err != nil {
@@ -310,7 +310,7 @@ func runDownloadScenario(t *testing.T, scenario string) {
 		t.Fatal(err)
 	}
 	output := prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
-	runErr := run()
+	runErr := run(25 * time.Millisecond)
 	if scenario == "existing output" {
 		// Output refusal now happens before connecting. Release the unused fake peer.
 		peerListener.Close()
@@ -330,7 +330,7 @@ func runDownloadScenario(t *testing.T, scenario string) {
 		if scenario == "existing output" && !os.IsExist(runErr) {
 			t.Errorf("expected file-exists error, got %v", runErr)
 		}
-		if corrupted && (!strings.Contains(runErr.Error(), "exhausted peers") || !strings.Contains(output.String(), "hash")) {
+		if corrupted && (!strings.Contains(runErr.Error(), "peer discovery attempts") || !strings.Contains(output.String(), "hash")) {
 			t.Errorf("expected peer exhaustion with logged hash failure, got %v; logs %q", runErr, output.String())
 		}
 	}
@@ -469,7 +469,7 @@ func TestRunTrackerFailures(t *testing.T) {
 				t.Fatal(err)
 			}
 			prepareRun(t, "-torrent", path, "-output", outputPath)
-			err := run()
+			err := run(25 * time.Millisecond)
 			if err == nil {
 				t.Fatal("expected tracker error")
 			}
@@ -504,7 +504,7 @@ func TestRunExistingOutputDoesNotAnnounce(t *testing.T) {
 		t.Fatal(err)
 	}
 	prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
-	if err := run(); !os.IsExist(err) {
+	if err := run(25 * time.Millisecond); !os.IsExist(err) {
 		t.Errorf("error = %v, want file-exists error", err)
 	}
 	if len(requests) != 0 {
@@ -540,7 +540,7 @@ func TestRunNoPeers(t *testing.T) {
 				t.Fatal(err)
 			}
 			logs := prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
-			err := run()
+			err := run(25 * time.Millisecond)
 			if len(announces) != 2 {
 				t.Errorf("announce count = %d, want started and stopped", len(announces))
 			}
@@ -571,7 +571,7 @@ func TestRunNoPeers(t *testing.T) {
 					t.Error("initially complete torrent attempted an unnecessary completion announce")
 				}
 			} else {
-				if err == nil || !strings.Contains(err.Error(), "exhausted peers") {
+				if err == nil || !strings.Contains(err.Error(), "peer discovery attempts") {
 					t.Errorf("error = %v, want peer exhaustion", err)
 				}
 				if strings.Contains(logs.String(), "download complete") {
@@ -600,7 +600,7 @@ func TestRunRequiresArguments(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			prepareRun(t, tt.args...)
-			err := run()
+			err := run(25 * time.Millisecond)
 			if err == nil || !strings.Contains(err.Error(), tt.message) {
 				t.Errorf("error = %v, want %q", err, tt.message)
 			}
@@ -623,7 +623,7 @@ func TestRunRejectsUnreadableOrInvalidTorrent(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			output := prepareRun(t, "-torrent", tt.path, "-output", filepath.Join(dir, "output.bin"))
-			if err := run(); err == nil {
+			if err := run(25 * time.Millisecond); err == nil {
 				t.Error("expected an error")
 			}
 			if strings.Contains(output.String(), "Torrent file read") {
@@ -647,7 +647,7 @@ func TestRunPortRange(t *testing.T) {
 	} {
 		t.Run(tt.port, func(t *testing.T) {
 			prepareRun(t, "-torrent", missingPath, "-output", "output.bin", "-port", tt.port)
-			err := run()
+			err := run(25 * time.Millisecond)
 			if tt.valid {
 				// An accepted port reaches the next step: opening the torrent file.
 				if !os.IsNotExist(err) {

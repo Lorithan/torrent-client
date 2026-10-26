@@ -19,13 +19,14 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
+	const waitTimeout = 45 * time.Second // Maybe later this can be a user configured param
+	if err := run(waitTimeout); err != nil {
 		log.Printf("error: %v", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(waitTimeout time.Duration) error {
 	torrentPath := flag.String("torrent", "", "location of torrent file")
 	output := flag.String("output", "", "destination of download")
 	nPort := flag.Int("port", 0, "port number to listen on")
@@ -98,6 +99,9 @@ func run() error {
 		return err
 	}
 
+	peers := newPeerQueue()
+	peers.Add(response.Peers)
+
 	regularAnnounce := func() (*tracker.TrackerResponse, error) {
 		stats := session.Stats()
 		params := tracker.AnnounceParams{
@@ -106,8 +110,12 @@ func run() error {
 			Left:       stats.Left,
 			Event:      tracker.AnnounceEventDefault,
 		}
-		return tracker.Announce(torrentData, peerID, uint16(addr.Port), &httpClient, params)
-
+		response, err := tracker.Announce(torrentData, peerID, uint16(addr.Port), &httpClient, params)
+		if err != nil {
+			return response, err
+		}
+		peers.Add(response.Peers)
+		return response, err
 	}
 
 	defer func() {
@@ -126,9 +134,11 @@ func run() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	updatesDone := make(chan struct{})
+	refreshPeer := make(chan struct{}, 1)
+	minDelay := 5 * time.Second
 	go func() {
 		defer close(updatesDone)
-		runTrackerUpdates(ctx, response.Interval, regularAnnounce)
+		runTrackerUpdates(ctx, refreshPeer, response.Interval, minDelay, regularAnnounce)
 	}()
 	stopUpdates := func() {
 		cancel()
@@ -143,7 +153,7 @@ func run() error {
 		PeerID:   peerID,
 	}
 
-	err = downloadFromPeers(response.Peers, local, len(torrentData.Pieces), session)
+	err = downloadFromPeers(ctx, refreshPeer, peers, local, len(torrentData.Pieces), session, waitTimeout)
 	stopUpdates()
 	if err != nil {
 		return err
@@ -220,17 +230,55 @@ func preparePeer(addr net.TCPAddr, local peer.Handshake, pieceCount int) (*peer.
 }
 
 func downloadFromPeers(
-	addrs []net.TCPAddr,
+	ctx context.Context,
+	refresh chan<- struct{},
+	peers *peerQueue,
 	local peer.Handshake,
 	pieceCount int,
 	session *download.Session,
+	waitTimeout time.Duration,
 ) error {
-	if session.Complete() {
-		return nil
-	}
+	const attemptsAllowed = 3
 
-	var peerErr *download.PeerError
-	for _, addr := range addrs {
+	attempts := 0
+	left := session.Stats().Left
+	for {
+		newLeft := session.Stats().Left
+		if newLeft < left {
+			left = newLeft
+			attempts = 0
+		}
+
+		err := ctx.Err()
+		if err != nil {
+			return err
+		}
+
+		if session.Complete() {
+			return nil
+		}
+		var peerErr *download.PeerError
+
+		addr, next := peers.Next()
+		if !next {
+			if attempts == attemptsAllowed {
+				return fmt.Errorf("exceed peer discovery attempts")
+			}
+			attempts += 1
+
+			addr, err = waitForPeer(ctx, refresh, peers, waitTimeout)
+			if err != nil {
+				if cancelled := ctx.Err(); cancelled != nil {
+					return cancelled
+				}
+				if err == context.DeadlineExceeded {
+					continue
+				}
+
+				return err
+			}
+		}
+
 		client, err := preparePeer(addr, local, pieceCount)
 		if err != nil {
 			retryable := errors.As(err, &peerErr)
@@ -257,6 +305,4 @@ func downloadFromPeers(
 			return nil
 		}
 	}
-
-	return fmt.Errorf("exhausted peers before session completed")
 }

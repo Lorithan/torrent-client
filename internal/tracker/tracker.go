@@ -2,7 +2,6 @@ package tracker
 
 import (
 	"crypto/rand"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
@@ -191,39 +190,22 @@ func parseTrackerResponse(data []byte) (*TrackerResponse, error) {
 		return nil, fmt.Errorf("Field `interval` too large.")
 	}
 
-	peers, ok := decodedMap["peers"].(string)
-
-	if !ok {
-		return nil, fmt.Errorf("Expected `peers` from response")
+	var peers []net.TCPAddr
+	switch peersData := decodedMap["peers"].(type) {
+	case string:
+		peers, err = parseCompactPeers(peersData)
+	case []any:
+		peers, err = parseDictionaryPeers(peersData)
+	default:
+		return nil, fmt.Errorf("malformed or missing peers field")
 	}
-
-	if len(peers)%6 != 0 {
-		return nil, fmt.Errorf("Field `peers` is malformed")
-	}
-
-	peersList := make([]net.TCPAddr, 0, len(peers)/6)
-	i := 0
-
-	for {
-		if i+6 > len(peers) {
-			break
-		}
-
-		addrBytes := []byte(peers[i : i+6])
-
-		addr := net.TCPAddr{
-			IP:   net.IPv4(addrBytes[0], addrBytes[1], addrBytes[2], addrBytes[3]),
-			Port: int(binary.BigEndian.Uint16(addrBytes[4:6])),
-		}
-
-		peersList = append(peersList, addr)
-
-		i += 6
+	if err != nil {
+		return nil, err
 	}
 
 	response := TrackerResponse{
 		Interval: time.Duration(interval) * time.Second,
-		Peers:    peersList,
+		Peers:    peers,
 	}
 
 	return &response, nil

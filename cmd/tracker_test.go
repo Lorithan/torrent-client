@@ -24,9 +24,19 @@ import (
 
 func startTrackerUpdatesTest(t *testing.T, interval time.Duration, announce func() (*tracker.TrackerResponse, error)) (context.CancelFunc, <-chan struct{}) {
 	t.Helper()
+	return startTrackerUpdatesWithRefreshTest(t, nil, interval, announce)
+}
+
+func startTrackerUpdatesWithRefreshTest(t *testing.T, refresh <-chan struct{}, interval time.Duration, announce func() (*tracker.TrackerResponse, error)) (context.CancelFunc, <-chan struct{}) {
+	t.Helper()
+	return startTrackerUpdatesWithDelayTest(t, refresh, interval, 0, announce)
+}
+
+func startTrackerUpdatesWithDelayTest(t *testing.T, refresh <-chan struct{}, interval, minDelay time.Duration, announce func() (*tracker.TrackerResponse, error)) (context.CancelFunc, <-chan struct{}) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); runTrackerUpdates(ctx, interval, announce) }()
+	go func() { defer close(done); runTrackerUpdates(ctx, refresh, interval, minDelay, announce) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -36,6 +46,87 @@ func startTrackerUpdatesTest(t *testing.T, interval time.Duration, announce func
 		}
 	})
 	return cancel, done
+}
+
+func TestRunDiscoversPeerAfterEmptyInitialAnnounce(t *testing.T) {
+	hash := sha1.Sum([]byte("data"))
+	info := "d6:lengthi8e4:name8:file.bin12:piece lengthi4e6:pieces40:" + string(hash[:]) + string(hash[:]) + "e"
+	local := peer.Handshake{InfoHash: sha1.Sum([]byte(info))}
+	addr, peerDone := startFallbackTestPeerWithVerifier(t, local, func(conn net.Conn) error {
+		for _, index := range []uint32{0, 1} {
+			if err := fallbackTestRequest(conn, index); err != nil {
+				return err
+			}
+			if err := fallbackTestReply(conn, index, []byte("data")); err != nil {
+				return err
+			}
+			if err := fallbackTestHave(conn, index); err != nil {
+				return err
+			}
+		}
+		return fallbackTestExpectClosed(conn)
+	}, func(wire [68]byte) error {
+		if !bytes.Equal(wire[28:48], local.InfoHash[:]) {
+			return errors.New("incorrect info hash")
+		}
+		return nil
+	}, 10*time.Second)
+	compact := binary.BigEndian.AppendUint16([]byte{127, 0, 0, 1}, uint16(addr.Port))
+	requests := make(chan url.Values, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		requests <- q
+		peers := ""
+		if q.Get("event") == "" {
+			peers = string(compact)
+		}
+		_, _ = fmt.Fprintf(w, "d8:intervali1800e5:peers%d:%se", len(peers), peers)
+	}))
+	t.Cleanup(server.Close)
+	dir := t.TempDir()
+	torrentPath, outputPath := filepath.Join(dir, "input.torrent"), filepath.Join(dir, "output.bin")
+	meta := fmt.Appendf(nil, "d8:announce%d:%s4:info%se", len(server.URL), server.URL, info)
+	if err := os.WriteFile(torrentPath, meta, 0600); err != nil {
+		t.Fatal(err)
+	}
+	prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
+	// Allow the production five-second announce cooldown, without waiting for
+	// the tracker's thirty-minute periodic interval.
+	if err := run(10 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(outputPath)
+	if err != nil || !bytes.Equal(data, []byte("datadata")) {
+		t.Fatalf("output = %q, error %v; want datadata", data, err)
+	}
+	if len(requests) != 4 {
+		t.Fatalf("announces = %d, want 4", len(requests))
+	}
+	var started url.Values
+	for _, event := range []string{"started", "", "completed", "stopped"} {
+		q := <-requests
+		if q.Get("event") != event {
+			t.Errorf("event = %q, want %q", q.Get("event"), event)
+		}
+		if event == "started" {
+			started = q
+		}
+		for _, key := range []string{"peer_id", "info_hash", "port"} {
+			if q.Get(key) != started.Get(key) {
+				t.Errorf("%s changed during rediscovery", key)
+			}
+		}
+		left, downloaded := "8", "0"
+		if event == "completed" || event == "stopped" {
+			left, downloaded = "0", "8"
+		}
+		if q.Get("left") != left || q.Get("downloaded") != downloaded {
+			t.Errorf("event %q: left=%s, downloaded=%s; want %s, %s", event, q.Get("left"), q.Get("downloaded"), left, downloaded)
+		}
+	}
 }
 
 func TestRunJoinsPeriodicAnnounceBeforeLifecycleEvents(t *testing.T) {
@@ -49,6 +140,10 @@ func TestRunJoinsPeriodicAnnounceBeforeLifecycleEvents(t *testing.T) {
 	release := func() { releaseOnce.Do(func() { close(releaseResponse) }) }
 	defer release()
 	addr, peerDone := startFallbackTestPeerWithVerifier(t, peer.Handshake{InfoHash: infoHash}, func(conn net.Conn) error {
+		// The real CLI now waits five seconds before its earliest regular announce.
+		if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			return err
+		}
 		if err := fallbackTestRequest(conn, 0); err != nil {
 			return err
 		}
@@ -63,7 +158,7 @@ func TestRunJoinsPeriodicAnnounceBeforeLifecycleEvents(t *testing.T) {
 		}
 		select {
 		case <-periodicStarted:
-		case <-time.After(3 * time.Second):
+		case <-time.After(8 * time.Second):
 			return errors.New("periodic announce never started during transfer")
 		}
 		if err := fallbackTestReply(conn, 1, []byte("efgh")); err != nil {
@@ -118,7 +213,7 @@ func TestRunJoinsPeriodicAnnounceBeforeLifecycleEvents(t *testing.T) {
 	}
 	prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
 	runDone := make(chan error, 1)
-	go func() { runDone <- run() }()
+	go func() { runDone <- run(25 * time.Millisecond) }()
 	// Join run before prepareRun restores the process-wide flags and logger.
 	var result error
 	joined := false
@@ -127,7 +222,7 @@ func TestRunJoinsPeriodicAnnounceBeforeLifecycleEvents(t *testing.T) {
 		if !joined {
 			select {
 			case <-runDone:
-			case <-time.After(5 * time.Second):
+			case <-time.After(10 * time.Second):
 				t.Error("CLI did not finish during test cleanup")
 			}
 		}
@@ -144,7 +239,7 @@ func TestRunJoinsPeriodicAnnounceBeforeLifecycleEvents(t *testing.T) {
 		default:
 			t.Fatal("peer exited without finishing the transfer")
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("transfer never reached the held periodic request")
 	}
 	if len(requests) != 2 {
@@ -173,7 +268,7 @@ func TestRunJoinsPeriodicAnnounceBeforeLifecycleEvents(t *testing.T) {
 		select {
 		case result = <-runDone:
 			joined = true
-		case <-time.After(5 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatal("CLI did not finish after releasing the regular announce")
 		}
 	}
@@ -192,6 +287,74 @@ func TestRunJoinsPeriodicAnnounceBeforeLifecycleEvents(t *testing.T) {
 	got, err := os.ReadFile(outputPath)
 	if err != nil || !bytes.Equal(got, []byte("abcdefgh")) {
 		t.Errorf("output = %q, error %v", got, err)
+	}
+}
+
+func TestTrackerUpdatesRefreshBeforeInterval(t *testing.T) {
+	for _, failFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("first_announce_fails=%t", failFirst), func(t *testing.T) {
+			refresh := make(chan struct{}, 1)
+			calls := make(chan int, 2)
+			attempt := 0
+			cancel, done := startTrackerUpdatesWithRefreshTest(t, refresh, time.Hour, func() (*tracker.TrackerResponse, error) {
+				attempt++
+				calls <- attempt
+				if failFirst && attempt == 1 {
+					return nil, errors.New("tracker temporarily unavailable")
+				}
+				return &tracker.TrackerResponse{Interval: time.Hour}, nil
+			})
+			for want := 1; want <= 2; want++ {
+				refresh <- struct{}{}
+				select {
+				case got := <-calls:
+					if got != want {
+						t.Errorf("announce attempt = %d, want %d", got, want)
+					}
+				case <-time.After(time.Second):
+					t.Fatalf("refresh %d did not trigger an announce before the periodic interval", want)
+				}
+			}
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("worker did not stop after refreshes")
+			}
+		})
+	}
+}
+
+func TestTrackerUpdatesMinimumDelay(t *testing.T) {
+	for _, failFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("first_announce_fails=%t", failFirst), func(t *testing.T) {
+			const minDelay = 30 * time.Millisecond
+			refresh := make(chan struct{}, 1)
+			calls := make(chan time.Time, 2)
+			started := time.Now()
+			attempt := 0
+			startTrackerUpdatesWithDelayTest(t, refresh, time.Hour, minDelay, func() (*tracker.TrackerResponse, error) {
+				attempt++
+				calls <- time.Now()
+				if failFirst && attempt == 1 {
+					return nil, errors.New("tracker temporarily unavailable")
+				}
+				return &tracker.TrackerResponse{Interval: time.Hour}, nil
+			})
+			previous := started
+			for i := 0; i < 2; i++ {
+				refresh <- struct{}{}
+				select {
+				case at := <-calls:
+					if elapsed := at.Sub(previous); elapsed < minDelay {
+						t.Errorf("announce %d after %v, want at least %v", i+1, elapsed, minDelay)
+					}
+					previous = at
+				case <-time.After(time.Second):
+					t.Fatalf("refresh %d never announced after its cooldown", i+1)
+				}
+			}
+		})
 	}
 }
 

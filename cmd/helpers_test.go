@@ -66,14 +66,18 @@ func startFallbackTestPeer(t *testing.T, local peer.Handshake, serve func(net.Co
 	return startFallbackTestPeerWithVerifier(t, local, serve, nil)
 }
 
-func startFallbackTestPeerWithVerifier(t *testing.T, local peer.Handshake, serve func(net.Conn) error, verify func([68]byte) error) (net.TCPAddr, <-chan error) {
+func startFallbackTestPeerWithVerifier(t *testing.T, local peer.Handshake, serve func(net.Conn) error, verify func([68]byte) error, timeouts ...time.Duration) (net.TCPAddr, <-chan error) {
 	t.Helper()
+	timeout := 3 * time.Second
+	if len(timeouts) > 0 {
+		timeout = timeouts[0]
+	}
 	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { listener.Close() })
-	if err := listener.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+	if err := listener.SetDeadline(time.Now().Add(timeout)); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
@@ -85,7 +89,7 @@ func startFallbackTestPeerWithVerifier(t *testing.T, local peer.Handshake, serve
 		}
 		listener.Close() // One attempt per fixture; unintended retries fail promptly.
 		defer conn.Close()
-		if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 			done <- err
 			return
 		}

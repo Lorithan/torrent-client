@@ -51,6 +51,119 @@ func TestParseTrackerResponseCompact(t *testing.T) {
 	}
 }
 
+func TestParseCompactPeersRejectsZeroPort(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		data []byte
+	}{
+		{"first peer", []byte{127, 0, 0, 1, 0, 0}},
+		{"after valid peer", []byte{127, 0, 0, 1, 26, 225, 192, 0, 2, 1, 0, 0}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			peers, err := parseCompactPeers(string(tt.data))
+			if err == nil {
+				t.Fatal("expected an error for port zero")
+			}
+			if len(peers) != 0 {
+				t.Errorf("returned partial peers on failure: %v", peers)
+			}
+		})
+	}
+}
+
+func TestParseTrackerResponseDictionary(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		list string
+		want []string
+	}{
+		{"empty list", "le", nil},
+		{"one peer", "ld2:ip9:127.0.0.14:porti6881eee", []string{"127.0.0.1:6881"}},
+		{"multiple peers", "ld2:ip9:192.0.2.14:porti1eed2:ip12:198.51.100.24:porti65535eee", []string{"192.0.2.1:1", "198.51.100.2:65535"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			data := []byte("d8:intervali1800e5:peers" + tt.list + "e")
+			got, err := parseTrackerResponse(data)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got == nil {
+				t.Fatal("nil response without error")
+			}
+			if got.Interval != 30*time.Minute || len(got.Peers) != len(tt.want) {
+				t.Fatalf("response = %+v, want interval 30m and %d peers", got, len(tt.want))
+			}
+			for i, want := range tt.want {
+				if got.Peers[i].String() != want {
+					t.Errorf("peer %d = %s, want %s", i, got.Peers[i].String(), want)
+				}
+			}
+		})
+	}
+}
+
+func TestParseDictionaryPeers(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		data []any
+		want []string
+	}{
+		{"empty", nil, nil},
+		{"one peer", []any{map[string]any{"ip": "127.0.0.1", "port": int64(6881)}}, []string{"127.0.0.1:6881"}},
+		{"multiple peers and port boundaries", []any{
+			map[string]any{"ip": "192.0.2.1", "port": int64(1), "peer id": "ignored"},
+			map[string]any{"ip": "198.51.100.2", "port": int64(65535)},
+		}, []string{"192.0.2.1:1", "198.51.100.2:65535"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseDictionaryPeers(tt.data)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d peers, want %d", len(got), len(tt.want))
+			}
+			for i, want := range tt.want {
+				if got[i].IP.To4() == nil || got[i].String() != want {
+					t.Errorf("peer %d = %v, want IPv4 address %s", i, got[i], want)
+				}
+			}
+		})
+	}
+}
+
+func TestParseDictionaryPeersInvalid(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		entry any
+	}{
+		{"not a dictionary", "peer"},
+		{"nil entry", nil},
+		{"missing IP", map[string]any{"port": int64(6881)}},
+		{"wrong IP type", map[string]any{"ip": int64(1), "port": int64(6881)}},
+		{"empty IP", map[string]any{"ip": "", "port": int64(6881)}},
+		{"malformed IP", map[string]any{"ip": "999.1.1.1", "port": int64(6881)}},
+		{"unsupported IPv6", map[string]any{"ip": "2001:db8::1", "port": int64(6881)}},
+		{"missing port", map[string]any{"ip": "192.0.2.1"}},
+		{"wrong port type", map[string]any{"ip": "192.0.2.1", "port": "6881"}},
+		{"zero port", map[string]any{"ip": "192.0.2.1", "port": int64(0)}},
+		{"negative port", map[string]any{"ip": "192.0.2.1", "port": int64(-1)}},
+		{"port too large", map[string]any{"ip": "192.0.2.1", "port": int64(65536)}},
+		{"maximum int64 port", map[string]any{"ip": "192.0.2.1", "port": int64(9223372036854775807)}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// A bad later entry must fail the entire response, not return partial peers.
+			got, err := parseDictionaryPeers([]any{map[string]any{"ip": "192.0.2.1", "port": int64(6881)}, tt.entry})
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if len(got) != 0 {
+				t.Errorf("returned partial peers on failure: %v", got)
+			}
+		})
+	}
+}
+
 func TestParseTrackerResponseInvalid(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -69,6 +182,11 @@ func TestParseTrackerResponseInvalid(t *testing.T) {
 		{"missing peers", "d8:intervali1800ee", ""},
 		{"wrong peers type", "d8:intervali1800e5:peersi1ee", ""},
 		{"incomplete peer record", "d8:intervali1800e5:peers5:abcdee", ""},
+		{"compact peer with zero port", string(append([]byte("d8:intervali1800e5:peers6:"), 127, 0, 0, 1, 0, 0, 'e')), ""},
+		{"dictionary instead of peer list", "d8:intervali1800e5:peersdee", ""},
+		{"non-dictionary peer entry", "d8:intervali1800e5:peersli1eee", ""},
+		{"dictionary peer without port", "d8:intervali1800e5:peersld2:ip9:127.0.0.1eee", ""},
+		{"dictionary peer with zero port", "d8:intervali1800e5:peersld2:ip9:127.0.0.14:porti0eeee", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
