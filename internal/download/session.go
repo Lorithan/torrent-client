@@ -45,15 +45,7 @@ func NewSession(tf *torrent.TorrentFile, dst io.WriterAt) (*Session, error) {
 		return nil, fmt.Errorf("mismatch piece count, expected %d found %d", expectedPieceCount, len(tf.Pieces))
 	}
 
-	remainder := expectedPieceCount % 8
-
-	// Each byte holds eight pieces; a partial group needs one additional byte.
-	requiredBytes := expectedPieceCount / 8
-	if remainder > 0 {
-		requiredBytes += 1
-	}
-
-	completed := make(peer.Bitfield, requiredBytes)
+	completed := peer.NewBitfield(int(expectedPieceCount))
 	completedCount := 0
 
 	stats := Stats{
@@ -112,9 +104,9 @@ func (s *Session) DownloadFrom(client *peer.Client) error {
 			return err
 		}
 
-		n, err := s.dest.WriteAt(piece, int64(index)*s.torrent.PieceLength)
+		err = s.storePiece(index, piece)
 		if err != nil {
-			return fmt.Errorf("write piece %d: %w", index, err)
+			return err
 		}
 
 		err = s.completed.SetPiece(index)
@@ -127,30 +119,12 @@ func (s *Session) DownloadFrom(client *peer.Client) error {
 		s.stats.Left -= int64(len(piece))
 		s.statsMu.Unlock()
 
-		message := peer.NewHave(uint32(index))
-		err = client.Conn.SetDeadline(time.Now().Add(30 * time.Second))
+		err = sendHave(client, uint32(index))
 		if err != nil {
-			return &PeerError{
-				Op:  fmt.Sprintf("set deadline to announce piece %d", index),
-				Err: err,
-			}
-		}
-		err = client.SendMessage(message)
-		if err != nil {
-			return &PeerError{
-				Op:  fmt.Sprintf("announce piece %d", index),
-				Err: err,
-			}
-		}
-		err = client.Conn.SetDeadline(time.Time{})
-		if err != nil {
-			return &PeerError{
-				Op:  fmt.Sprintf("clear deadline after announcing piece %d", index),
-				Err: err,
-			}
+			return err
 		}
 
-		log.Printf("Piece %d completed, %d/%d, %d bytes written", index, s.completedCount, len(s.torrent.Pieces), n)
+		log.Printf("Piece %d completed, %d/%d, %d bytes written", index, s.completedCount, len(s.torrent.Pieces), len(piece))
 	}
 
 	return nil
@@ -165,4 +139,24 @@ func (s *Session) Stats() Stats {
 	s.statsMu.Lock()
 	defer s.statsMu.Unlock()
 	return s.stats
+}
+
+func (s *Session) storePiece(index int, data []byte) error {
+	expectedSize, err := PieceSize(s.torrent, index)
+	if err != nil {
+		return err
+	}
+	if expectedSize != int64(len(data)) {
+		return fmt.Errorf("data size mismatch. expected %d bytes, found %d bytes", expectedSize, len(data))
+	}
+
+	n, err := s.dest.WriteAt(data, int64(index)*s.torrent.PieceLength)
+	if err != nil {
+		return fmt.Errorf("write error for piece %d: %w", index, err)
+	}
+	if n != int(expectedSize) {
+		return fmt.Errorf("write error for piece %d: %w", index, io.ErrShortWrite)
+	}
+
+	return nil
 }

@@ -116,6 +116,103 @@ func TestSessionDownloadFromRetainsCommittedPieceOnHaveFailure(t *testing.T) {
 	}
 }
 
+func TestSessionStorePieceWritesExactOffsetWithoutCompleting(t *testing.T) {
+	for _, tt := range []struct {
+		index  int
+		data   string
+		offset int64
+	}{
+		{0, "abcd", 0},
+		{1, "efgh", 4},
+		{2, "ij", 8},
+	} {
+		t.Run(fmt.Sprintf("piece_%d", tt.index), func(t *testing.T) {
+			tf := &torrent.TorrentFile{Length: 10, PieceLength: 4, Pieces: make([][20]byte, 3)}
+			dst := &downloadTestWriter{}
+			s, err := NewSession(tf, dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := s.Stats()
+			if err := s.storePiece(tt.index, []byte(tt.data)); err != nil {
+				t.Fatal(err)
+			}
+			if len(dst.writes) != 1 || dst.writes[0].offset != tt.offset || !bytes.Equal(dst.writes[0].data, []byte(tt.data)) {
+				t.Fatalf("unexpected output writes: %+v", dst.writes)
+			}
+			if s.completedCount != 0 || s.completed.HasPiece(tt.index) || s.Stats() != before {
+				t.Error("storage helper changed completion or statistics")
+			}
+		})
+	}
+}
+
+func TestSessionStorePieceRejectsInvalidDataBeforeWriting(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		index int
+		data  string
+	}{
+		{"negative index", -1, "abcd"},
+		{"index at piece count", 3, "abcd"},
+		{"empty data", 0, ""},
+		{"short data", 0, "abc"},
+		{"oversized data", 0, "abcde"},
+		{"final piece must be short", 2, "abcd"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dst := &downloadTestWriter{}
+			tf := &torrent.TorrentFile{Length: 10, PieceLength: 4, Pieces: make([][20]byte, 3)}
+			s, err := NewSession(tf, dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := s.Stats()
+			if err := s.storePiece(tt.index, []byte(tt.data)); err == nil {
+				t.Fatal("expected input validation error")
+			}
+			if len(dst.writes) != 0 || s.completedCount != 0 || s.Stats() != before {
+				t.Error("invalid piece reached storage or changed session progress")
+			}
+		})
+	}
+}
+
+func TestSessionStorePiecePreservesWriteErrors(t *testing.T) {
+	diskErr := errors.New("disk full")
+	for _, tt := range []struct {
+		name string
+		n    int
+		err  error
+		want error
+	}{
+		{"partial write without error", 2, nil, io.ErrShortWrite},
+		{"zero write without error", 0, nil, io.ErrShortWrite},
+		{"partial write with error", 2, diskErr, diskErr},
+		{"full write with error", 4, diskErr, diskErr},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tf := &torrent.TorrentFile{Length: 4, PieceLength: 4, Pieces: make([][20]byte, 1)}
+			dst := completionTestWriterFunc(func([]byte, int64) (int, error) { return tt.n, tt.err })
+			s, err := NewSession(tf, dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = s.storePiece(0, []byte("abcd"))
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("error = %v, want cause %v", err, tt.want)
+			}
+			var peerErr *PeerError
+			if errors.As(err, &peerErr) {
+				t.Error("storage error classified as retryable peer failure")
+			}
+			if s.completedCount != 0 || s.completed.HasPiece(0) || s.Stats().Left != 4 {
+				t.Error("failed storage write changed completion")
+			}
+		})
+	}
+}
+
 func TestSessionDownloadFromDoesNotCommitFailedWrite(t *testing.T) {
 	client, tf, conn, _ := downloadFixture(t, 4, 4, -1)
 	wantErr := errors.New("disk full")

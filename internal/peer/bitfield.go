@@ -4,6 +4,18 @@ import "fmt"
 
 type Bitfield []byte
 
+func NewBitfield(pieceCount int) Bitfield {
+	remainder := pieceCount % 8
+
+	// Each byte holds eight pieces; a partial group needs one additional byte.
+	requiredBytes := pieceCount / 8
+	if remainder > 0 {
+		requiredBytes += 1
+	}
+
+	return make(Bitfield, requiredBytes)
+}
+
 func (b Bitfield) HasPiece(index int) bool {
 	if index < 0 {
 		return false
