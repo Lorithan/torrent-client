@@ -44,11 +44,14 @@ The implementation currently provides:
 - Outgoing TCP connections, handshakes, and trying another address when initial
   connection or handshake attempts fail.
 - Peer message framing, bitfield validation, have messages, and choke state.
-- One outstanding block request at a time on one peer connection.
+- Concurrent downloading in bounded peer batches, controlled by the CLI's
+  `-workers` flag (default four), with one outstanding block request per worker.
+- Explicit missing, assigned, and complete piece states owned by one coordinator.
+  Workers own their connections and send independent availability snapshots.
 - Selection of advertised, unfinished pieces and writes at their file offsets.
 - Piece SHA-1 verification before writing or announcing completion.
-- Session-owned completed-piece tracking and sequential replacement of failed
-  peers, preserving verified output and retrying interrupted or corrupt pieces.
+- Session-owned completed-piece tracking and failed-work reassignment, preserving
+  verified output across peer groups and retrying interrupted or corrupt pieces.
 - Separate deadlines for waiting for availability, requesting blocks, and sending
   completion announcements.
 - A CLI with explicit torrent/output paths and refusal to overwrite existing
@@ -58,15 +61,23 @@ Tests exercise complete downloads using local fake trackers and peers, output
 protection, invalid data, lifecycle ordering, bounded rediscovery, and several
 failure paths. A combined recovery test verifies that a tracker-discovered
 replacement finishes an interrupted transfer without requesting a completed
-piece again. Manual testing has shown
-sustained downloads from a real swarm; that does not establish successful
-completion of the large real-world torrent tested.
+piece again. Gated peers verify overlapping transfers in the download package and
+through the CLI. Parallel recovery tests cover disconnects and corrupt pieces
+while another transfer remains active, cancellation of stalled downloads and
+availability waits, and whole-batch shutdown on a storage error.
+
+Manual testing has shown sustained downloads from a real swarm; that does not
+establish successful completion of the large real-world torrent tested or manual
+verification of parallel downloading against a public swarm.
 
 The current listener reserves an incoming port but does not accept and serve
-incoming peers. Simultaneous peer downloads, uploading, seeding, and a TUI remain
-unfinished. Cancellation interrupts discovery waits and worker cooldowns;
-in-flight tracker HTTP calls and peer operations still rely on their timeouts
-rather than immediate context cancellation.
+incoming peers. Uploading, seeding, and a TUI remain unfinished. A batch prepares
+connections sequentially; new tracker peers join subsequent batches rather than
+being added to an active group. Canceling a peer group closes its connections and
+joins its workers before returning. Discovery waits and tracker-worker cooldowns
+also support cancellation. CLI signal/quit integration and immediate cancellation
+of in-flight tracker HTTP calls and peer preparation remain lifecycle work; those
+operations currently have bounded timeouts.
 
 ## First-release features and acceptance criteria
 
@@ -212,14 +223,14 @@ for UDP support or relying on a particular public swarm.
 Each milestone should preserve a working CLI and end with review, meaningful
 tests, and a focused commit. These are learning steps, not fixed dates.
 
-| Order | Milestone | Evidence needed before moving on |
-| --- | --- | --- |
-| 1 | Separate session progress from a peer; sequential fallback | Peer A fails; B finishes while completed pieces remain intact; fatal storage failures stop retries |
-| 2 | Tracker lifecycle and rediscovery | Correct current statistics/events and replacement peer discovery with bounded retries |
-| 3 | Concurrent peer scheduling | Complementary peers transfer concurrently; assignments recover on failure; race checks pass |
-| 4 | Incoming connections, uploading, and seeding | Valid requests receive verified stored data; completion transitions to seeding |
-| 5 | Shared status/cancellation and TUI | CLI and responsive TUI share the transfer engine; clean stop/quit |
-| 6 | Release verification and user documentation | Controlled complete transfers, recovery/seeding scenarios, installation/use instructions, and explicit limitations |
+| Order | Milestone | Status | Evidence needed before moving on |
+| --- | --- | --- | --- |
+| 1 | Separate session progress from a peer; sequential fallback | Complete | Peer A fails; B finishes while completed pieces remain intact; fatal storage failures stop retries |
+| 2 | Tracker lifecycle and rediscovery | Complete | Correct current statistics/events and replacement peer discovery with bounded retries |
+| 3 | Concurrent peer scheduling | Complete | Complementary peers transfer concurrently; assignments recover on failure; race checks pass |
+| 4 | Incoming connections, uploading, and seeding | Next | Valid requests receive verified stored data; completion transitions to seeding |
+| 5 | Shared status/cancellation and TUI | Planned | CLI and responsive TUI share the transfer engine; clean stop/quit |
+| 6 | Release verification and user documentation | Planned | Controlled complete transfers, recovery/seeding scenarios, installation/use instructions, and explicit limitations |
 
 Implement cancellation support when workers first need it; milestone 5 exposes
 and integrates it with the UI rather than postponing worker shutdown design.
@@ -247,7 +258,6 @@ Before adding a deferred feature, explicitly decide whether it is required for
 this release or belongs to a later milestone, and update this document. Avoid
 expanding the current task merely because an extension would be useful.
 
-Session progress, sequential fallback, and tracker lifecycle/rediscovery are
-implemented. The next implementation milestone is concurrent peer scheduling:
-bounded workers, explicit piece assignments, and coordinated completion and
-output accounting.
+Session progress, tracker lifecycle/rediscovery, and concurrent peer scheduling
+are implemented. The next milestone adds incoming connections, uploading verified
+pieces, and continuing to seed after download completion.

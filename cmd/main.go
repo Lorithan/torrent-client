@@ -30,6 +30,7 @@ func run(waitTimeout time.Duration) error {
 	torrentPath := flag.String("torrent", "", "location of torrent file")
 	output := flag.String("output", "", "destination of download")
 	nPort := flag.Int("port", 0, "port number to listen on")
+	workers := flag.Int("workers", 4, "number of workers dedicated to downloading")
 
 	flag.Parse()
 
@@ -45,6 +46,10 @@ func run(waitTimeout time.Duration) error {
 		return fmt.Errorf("port out of range")
 	}
 	port := uint16(*nPort)
+
+	if *workers < 1 {
+		return fmt.Errorf("workers must be greater than 0")
+	}
 
 	torrentFile, err := os.ReadFile(*torrentPath)
 	if err != nil {
@@ -153,7 +158,7 @@ func run(waitTimeout time.Duration) error {
 		PeerID:   peerID,
 	}
 
-	err = downloadFromPeers(ctx, refreshPeer, peers, local, len(torrentData.Pieces), session, waitTimeout)
+	err = downloadFromPeers(ctx, refreshPeer, peers, local, len(torrentData.Pieces), *workers, session, waitTimeout)
 	stopUpdates()
 	if err != nil {
 		return err
@@ -235,6 +240,7 @@ func downloadFromPeers(
 	peers *peerQueue,
 	local peer.Handshake,
 	pieceCount int,
+	workerLimit int,
 	session *download.Session,
 	waitTimeout time.Duration,
 ) error {
@@ -257,7 +263,27 @@ func downloadFromPeers(
 		if session.Complete() {
 			return nil
 		}
+
 		var peerErr *download.PeerError
+
+		preparedPeers, err := preparePeerBatch(ctx, peers, local, pieceCount, workerLimit)
+		if err != nil {
+			return err
+		}
+		if len(preparedPeers) > 0 {
+			err := session.DownloadFromPeers(ctx, preparedPeers, workerLimit)
+			if err != nil {
+				retryable := errors.As(err, &peerErr)
+				if retryable {
+					log.Printf("error downloading from peers: %s", err)
+					continue
+				} else {
+					return err
+				}
+			} else {
+				continue
+			}
+		}
 
 		addr, next := peers.Next()
 		if !next {
@@ -278,28 +304,7 @@ func downloadFromPeers(
 				return err
 			}
 		}
-
-		client, err := preparePeer(addr, local, pieceCount)
-		if err != nil {
-			retryable := errors.As(err, &peerErr)
-			if retryable {
-				log.Printf("error preparing peer %s: %s", addr.String(), err)
-				continue
-			} else {
-				return err
-			}
-		}
-
-		err = session.DownloadFrom(client)
-		client.Conn.Close()
-		if err != nil {
-			retryable := errors.As(err, &peerErr)
-			if retryable {
-				log.Printf("download from peer %s failed: %s", addr.String(), err)
-			} else {
-				return err
-			}
-		}
+		peers.Add([]net.TCPAddr{addr})
 
 		if session.Complete() {
 			return nil

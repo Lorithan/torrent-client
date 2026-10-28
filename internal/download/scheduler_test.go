@@ -219,3 +219,28 @@ func TestPieceSchedulerDoneTracksCompletionAcrossRetry(t *testing.T) {
 		t.Fatal("retried piece did not count as exactly one completion")
 	}
 }
+
+func TestPieceSchedulerHasMissing(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		states []pieceState
+		want   bool
+	}{
+		{"empty", nil, false},
+		{"missing", []pieceState{pieceMissing}, true},
+		{"all assigned", []pieceState{pieceAssigned, pieceAssigned}, false},
+		{"all complete", []pieceState{pieceComplete}, false},
+		{"assigned and complete", []pieceState{pieceAssigned, pieceComplete}, false},
+		{"missing after other states", []pieceState{pieceAssigned, pieceComplete, pieceMissing}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &pieceScheduler{states: slices.Clone(tt.states)}
+			if got := s.hasMissing(); got != tt.want {
+				t.Errorf("hasMissing = %t, want %t", got, tt.want)
+			}
+			if !slices.Equal(s.states, tt.states) {
+				t.Error("query changed scheduling state")
+			}
+		})
+	}
+}

@@ -67,3 +67,13 @@ func (s *pieceScheduler) complete(index int) error {
 func (s *pieceScheduler) done() bool {
 	return s.completedCount == len(s.states)
 }
+
+func (s *pieceScheduler) hasMissing() bool {
+	for _, piece := range s.states {
+		if piece == pieceMissing {
+			return true
+		}
+	}
+
+	return false
+}

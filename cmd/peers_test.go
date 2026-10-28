@@ -24,6 +24,184 @@ func testPeerQueue(addrs ...net.TCPAddr) *peerQueue {
 	return q
 }
 
+func TestPreparePeerBatchSkipsPeerFailuresAndBoundsAttempts(t *testing.T) {
+	local := peer.Handshake{InfoHash: [20]byte{1}}
+	good, goodDone := startFallbackTestPeer(t, local, fallbackTestExpectClosed)
+	bad, badDone := startSelectionTestPeer(t, local, local, true)
+	untouched := net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+	q := testPeerQueue(good, bad, untouched)
+	clients, err := preparePeerBatch(context.Background(), q, local, 2, 2)
+	for _, client := range clients {
+		t.Cleanup(func() { client.Conn.Close() })
+	}
+	if err != nil || len(clients) != 1 {
+		t.Fatalf("batch = %d clients, %v; want one prepared client", len(clients), err)
+	}
+	if err := clients[0].Conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Errorf("helper closed successfully returned connection: %v", err)
+	}
+	if addr, ok := q.Next(); !ok || addr.String() != untouched.String() {
+		t.Error("candidate limit was treated as a success count and consumed extra addresses")
+	}
+	clients[0].Conn.Close()
+	for _, done := range []<-chan error{goodDone, badDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(time.Second):
+			t.Error("prepared or rejected peer did not observe cleanup")
+		}
+	}
+}
+
+func TestPreparePeerBatchEmptyInvalidAndCanceled(t *testing.T) {
+	clients, err := preparePeerBatch(context.Background(), newPeerQueue(), peer.Handshake{}, 1, 4)
+	if err != nil || len(clients) != 0 {
+		t.Errorf("empty queue = %v, %v; want empty success", clients, err)
+	}
+	for _, limit := range []int{0, -1} {
+		q := testPeerQueue(net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+		clients, err := preparePeerBatch(context.Background(), q, peer.Handshake{}, 1, limit)
+		if err == nil || len(clients) != 0 {
+			t.Errorf("invalid limit %d accepted", limit)
+		}
+		if _, ok := q.Next(); !ok {
+			t.Error("invalid limit consumed a candidate")
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	q := testPeerQueue(net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	clients, err = preparePeerBatch(ctx, q, peer.Handshake{}, 1, 1)
+	if !errors.Is(err, context.Canceled) || len(clients) != 0 {
+		t.Errorf("canceled batch = %v, %v", clients, err)
+	}
+	if _, ok := q.Next(); !ok {
+		t.Error("already canceled batch consumed a candidate")
+	}
+}
+
+func TestPreparePeerBatchCancellationClosesPreparedClients(t *testing.T) {
+	for _, limit := range []int{1, 2} {
+		t.Run(fmt.Sprintf("limit_%d", limit), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			local := peer.Handshake{InfoHash: [20]byte{1}}
+			accepted := make(chan net.Conn, 1)
+			addr, done := startFallbackTestPeerWithVerifier(t, local, func(conn net.Conn) error {
+				accepted <- conn
+				return fallbackTestExpectClosed(conn)
+			}, func([68]byte) error {
+				// Cancel after preparation begins but before the handshake finishes.
+				// The helper must clean up rather than handing this client onward.
+				cancel()
+				return nil
+			})
+			untouched := net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+			q := testPeerQueue(addr, untouched)
+			clients, err := preparePeerBatch(ctx, q, local, 2, limit)
+			for _, client := range clients {
+				t.Cleanup(func() { client.Conn.Close() })
+			}
+			if !errors.Is(err, context.Canceled) || len(clients) != 0 {
+				t.Errorf("cancellation during preparation returned %d clients and %v; want no clients and context.Canceled", len(clients), err)
+			}
+			select {
+			case conn := <-accepted:
+				t.Cleanup(func() { conn.Close() })
+			case <-time.After(time.Second):
+				t.Fatal("fake peer did not reach prepared state")
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Error(err)
+				}
+			case <-time.After(time.Second):
+				t.Error("cancellation leaked a prepared connection")
+			}
+			if addr, ok := q.Next(); !ok || addr.String() != untouched.String() {
+				t.Error("cancellation consumed another candidate")
+			}
+		})
+	}
+}
+
+func TestPreparePeerBatchFatalPreparationStops(t *testing.T) {
+	local := peer.Handshake{InfoHash: [20]byte{1}}
+	addr, done := startSelectionTestPeer(t, local, local, false)
+	untouched := net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+	q := testPeerQueue(addr, untouched)
+	clients, err := preparePeerBatch(context.Background(), q, local, -1, 2)
+	var peerErr *download.PeerError
+	if err == nil || errors.As(err, &peerErr) || len(clients) != 0 {
+		t.Fatalf("fatal metadata preparation = %v, %v", clients, err)
+	}
+	if addr, ok := q.Next(); !ok || addr.String() != untouched.String() {
+		t.Error("fatal failure continued to another peer")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Error(err)
+		}
+	case <-time.After(time.Second):
+		t.Error("fatal preparation failure did not close its connection")
+	}
+}
+
+func TestDownloadFromPeersRetainsQueuedAddressAfterEmptyBatch(t *testing.T) {
+	local := peer.Handshake{InfoHash: [20]byte{1}}
+	badFirst, badFirstDone := startSelectionTestPeer(t, local, local, true)
+	badSecond, badSecondDone := startSelectionTestPeer(t, local, local, true)
+	good, goodDone := startFallbackTestPeer(t, local, func(conn net.Conn) error {
+		for _, index := range []uint32{0, 1} {
+			if err := fallbackTestRequest(conn, index); err != nil {
+				return err
+			}
+			if err := fallbackTestReply(conn, index, []byte("data")); err != nil {
+				return err
+			}
+			if err := fallbackTestHave(conn, index); err != nil {
+				return err
+			}
+		}
+		return fallbackTestExpectClosed(conn)
+	})
+	hash := sha1.Sum([]byte("data"))
+	tf := &torrent.TorrentFile{Length: 8, PieceLength: 4, Pieces: [][20]byte{hash, hash}}
+	dst := &fallbackTestWriter{data: make([]byte, 8)}
+	s, err := download.NewSession(tf, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	refresh := make(chan struct{}, 4)
+	err = downloadFromPeers(ctx, refresh, testPeerQueue(badFirst, badSecond, good), local, 2, 2, s, 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("good peer after empty batch was dropped: %v", err)
+	}
+	if !s.Complete() || string(dst.data) != "datadata" {
+		t.Error("queued good peer did not finish the file")
+	}
+	if len(refresh) != 0 {
+		t.Error("requested rediscovery despite an untried queued peer")
+	}
+	for _, done := range []<-chan error{badFirstDone, badSecondDone, goodDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(time.Second):
+			t.Error("peer did not observe connection cleanup")
+		}
+	}
+}
+
 func TestWaitForPeerAvailable(t *testing.T) {
 	q := newPeerQueue()
 	want := net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 6881}
@@ -186,7 +364,7 @@ func TestDownloadFromPeersUsesFirstDiscoveredPeer(t *testing.T) {
 		case <-ctx.Done():
 		}
 	}()
-	err = downloadFromPeers(ctx, refresh, q, local, 2, session, 25*time.Millisecond)
+	err = downloadFromPeers(ctx, refresh, q, local, 2, 1, session, 25*time.Millisecond)
 	cancel()
 	<-workerDone
 	if err != nil || !session.Complete() {
@@ -232,7 +410,7 @@ func TestDownloadFromPeersBoundsRediscoveryWithoutProgress(t *testing.T) {
 			}
 		}
 	}()
-	err = downloadFromPeers(ctx, refresh, q, peer.Handshake{}, 1, session, 25*time.Millisecond)
+	err = downloadFromPeers(ctx, refresh, q, peer.Handshake{}, 1, 1, session, 25*time.Millisecond)
 	cancel()
 	count := <-counts
 	if count != 3 {
@@ -302,7 +480,7 @@ func TestDownloadFromPeersResetsDiscoveryBudgetAfterProgress(t *testing.T) {
 			}
 		}
 	}()
-	err = downloadFromPeers(ctx, refresh, q, local, 2, session, 25*time.Millisecond)
+	err = downloadFromPeers(ctx, refresh, q, local, 2, 1, session, 25*time.Millisecond)
 	cancel()
 	count := <-counts
 	if err != nil || !session.Complete() || !bytes.Equal(dst.data, []byte("abcdefgh")) {
@@ -632,7 +810,7 @@ func TestDownloadFromPeersRetriesAfterHandshakeFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := downloadFromPeers(context.Background(), nil, testPeerQueue(bad, good), local, 2, session, 25*time.Millisecond); err != nil {
+	if err := downloadFromPeers(context.Background(), nil, testPeerQueue(bad, good), local, 2, 1, session, 25*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if !session.Complete() || !bytes.Equal(dst.data, []byte("datadata")) {
@@ -656,7 +834,7 @@ func TestDownloadFromPeersAllPreparationsFail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := downloadFromPeers(context.Background(), nil, testPeerQueue(first, second), local, 1, session, 25*time.Millisecond); err == nil {
+	if err := downloadFromPeers(context.Background(), nil, testPeerQueue(first, second), local, 1, 1, session, 25*time.Millisecond); err == nil {
 		t.Error("expected peer exhaustion error")
 	}
 	if session.Complete() || dst.calls != 0 {
@@ -676,7 +854,7 @@ func TestDownloadFromPeersNoAddressesWhileIncomplete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := downloadFromPeers(context.Background(), nil, newPeerQueue(), peer.Handshake{}, 1, session, 25*time.Millisecond); err == nil {
+	if err := downloadFromPeers(context.Background(), nil, newPeerQueue(), peer.Handshake{}, 1, 1, session, 25*time.Millisecond); err == nil {
 		t.Error("expected peer exhaustion error")
 	}
 }
@@ -721,7 +899,7 @@ func TestDownloadFromPeersContinuesAfterInterruptedPiece(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := downloadFromPeers(context.Background(), nil, testPeerQueue(first, second), local, 2, s, 25*time.Millisecond); err != nil {
+	if err := downloadFromPeers(context.Background(), nil, testPeerQueue(first, second), local, 2, 1, s, 25*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if !s.Complete() || dst.calls != 2 || !bytes.Equal(dst.data, []byte("abcdefgh")) {
@@ -740,7 +918,7 @@ func TestDownloadFromPeersCompletedSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := downloadFromPeers(context.Background(), nil, newPeerQueue(), peer.Handshake{}, 0, s, 25*time.Millisecond); err != nil {
+	if err := downloadFromPeers(context.Background(), nil, newPeerQueue(), peer.Handshake{}, 0, 1, s, 25*time.Millisecond); err != nil {
 		t.Errorf("already completed session should succeed without peers: %v", err)
 	}
 }
@@ -784,7 +962,7 @@ func TestDownloadFromPeersStopsOnStorageError(t *testing.T) {
 		conn.Close()
 		attempted <- true
 	}()
-	err = downloadFromPeers(context.Background(), nil, testPeerQueue(addr, *spare.Addr().(*net.TCPAddr)), local, 2, s, 25*time.Millisecond)
+	err = downloadFromPeers(context.Background(), nil, testPeerQueue(addr, *spare.Addr().(*net.TCPAddr)), local, 2, 1, s, 25*time.Millisecond)
 	spare.Close()
 	if <-attempted {
 		t.Error("storage failure attempted a replacement peer")
@@ -966,7 +1144,7 @@ func TestDownloadFromPeersRetriesCorruptPiece(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := downloadFromPeers(context.Background(), nil, testPeerQueue(bad, good), local, 2, session, 25*time.Millisecond); err != nil {
+	if err := downloadFromPeers(context.Background(), nil, testPeerQueue(bad, good), local, 2, 1, session, 25*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if !session.Complete() || dst.calls != 2 || !bytes.Equal(dst.data, []byte("abcdefgh")) {
@@ -1010,7 +1188,7 @@ func TestDownloadFromPeersExhaustsTransferFailuresAndClosesConnections(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = downloadFromPeers(context.Background(), nil, testPeerQueue(corrupt, truncated), local, 2, session, 25*time.Millisecond)
+	err = downloadFromPeers(context.Background(), nil, testPeerQueue(corrupt, truncated), local, 2, 1, session, 25*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "peer discovery attempts") {
 		t.Errorf("error = %v, want exhaustion", err)
 	}

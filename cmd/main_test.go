@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -97,7 +98,7 @@ func TestRunContinuesWithSecondPeer(t *testing.T) {
 	if err := os.WriteFile(torrentPath, meta, 0600); err != nil {
 		t.Fatal(err)
 	}
-	prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
+	prepareRun(t, "-torrent", torrentPath, "-output", outputPath, "-workers", "1")
 	if err := run(25 * time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
@@ -133,6 +134,149 @@ func TestRunContinuesWithSecondPeer(t *testing.T) {
 
 // run uses the standard flag set and logger; isolate their process-wide state
 // between tests. These tests must remain sequential.
+func TestRunWorkerFlagEnablesOverlappingPeerRequests(t *testing.T) {
+	firstHash, secondHash := sha1.Sum([]byte("abcd")), sha1.Sum([]byte("efgh"))
+	info := "d6:lengthi8e4:name8:file.bin12:piece lengthi4e6:pieces40:" + string(firstHash[:]) + string(secondHash[:]) + "e"
+	local := peer.Handshake{InfoHash: sha1.Sum([]byte(info))}
+	announcedIDs := make(chan string, 2)
+	verify := func(wire [68]byte) error {
+		select {
+		case id := <-announcedIDs:
+			if !bytes.Equal(wire[28:48], local.InfoHash[:]) || string(wire[48:]) != id {
+				return errors.New("handshake identity differs from tracker announce")
+			}
+		default:
+			return errors.New("peer connected before initial announce")
+		}
+		return nil
+	}
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	requests := make(chan uint32, 2)
+	serve := func(conn net.Conn) error {
+		request, err := peer.ReadMessage(conn)
+		if err != nil {
+			return err
+		}
+		if request == nil || request.ID != peer.MsgRequest || len(request.Payload) != 12 || binary.BigEndian.Uint32(request.Payload[4:8]) != 0 || binary.BigEndian.Uint32(request.Payload[8:]) != 4 {
+			return fmt.Errorf("unexpected request: %+v", request)
+		}
+		index := binary.BigEndian.Uint32(request.Payload[:4])
+		if index > 1 {
+			return fmt.Errorf("invalid piece index %d", index)
+		}
+		requests <- index
+		select {
+		case <-release:
+		case <-time.After(2 * time.Second):
+			return errors.New("CLI did not request work from both peers concurrently")
+		}
+		data := []byte("abcd")
+		if index == 1 {
+			data = []byte("efgh")
+		}
+		if err := fallbackTestReply(conn, index, data); err != nil {
+			return err
+		}
+		if err := fallbackTestHave(conn, index); err != nil {
+			return err
+		}
+		return fallbackTestExpectClosed(conn)
+	}
+	first, firstDone := startFallbackTestPeerWithVerifier(t, local, serve, verify)
+	second, secondDone := startFallbackTestPeerWithVerifier(t, local, serve, verify)
+	var compact []byte
+	for _, addr := range []net.TCPAddr{first, second} {
+		compact = append(compact, 127, 0, 0, 1)
+		compact = binary.BigEndian.AppendUint16(compact, uint16(addr.Port))
+	}
+	announces := make(chan url.Values, 8)
+	tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		announces <- query
+		if query.Get("event") == "started" {
+			announcedIDs <- query.Get("peer_id")
+			announcedIDs <- query.Get("peer_id")
+		}
+		_, _ = fmt.Fprintf(w, "d8:intervali1800e5:peers12:%se", string(compact))
+	}))
+	t.Cleanup(tracker.Close)
+	dir := t.TempDir()
+	torrentPath, outputPath := filepath.Join(dir, "input.torrent"), filepath.Join(dir, "output.bin")
+	meta := fmt.Appendf(nil, "d8:announce%d:%s4:info%se", len(tracker.URL), tracker.URL, info)
+	if err := os.WriteFile(torrentPath, meta, 0600); err != nil {
+		t.Fatal(err)
+	}
+	prepareRun(t, "-torrent", torrentPath, "-output", outputPath, "-workers", "2")
+	done := make(chan struct{})
+	var runErr error
+	go func() { defer close(done); runErr = run(25 * time.Millisecond) }()
+	// Join the CLI before prepareRun restores global flags and logging.
+	t.Cleanup(func() {
+		unblock()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("CLI did not finish during cleanup")
+		}
+	})
+	seen := make(map[uint32]bool)
+	for len(seen) < 2 {
+		select {
+		case index := <-requests:
+			if seen[index] {
+				t.Fatal("CLI scheduled a piece twice")
+			}
+			seen[index] = true
+		case <-done:
+			t.Fatalf("CLI returned before both peers received work: %v", runErr)
+		case <-time.After(time.Second):
+			t.Fatal("CLI did not overlap requests to two prepared peers")
+		}
+	}
+	unblock()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("CLI did not finish after releasing both peers")
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	for _, peerDone := range []<-chan error{firstDone, secondDone} {
+		if err := <-peerDone; err != nil {
+			t.Error(err)
+		}
+	}
+	output, err := os.ReadFile(outputPath)
+	if err != nil || string(output) != "abcdefgh" {
+		t.Errorf("output = %q, error %v", output, err)
+	}
+	if len(announces) != 3 {
+		t.Fatalf("announces = %d, want started/completed/stopped", len(announces))
+	}
+	var started url.Values
+	for _, event := range []string{"started", "completed", "stopped"} {
+		query := <-announces
+		if query.Get("event") != event {
+			t.Errorf("event = %q, want %q", query.Get("event"), event)
+		}
+		if event == "started" {
+			started = query
+		}
+		for _, key := range []string{"peer_id", "info_hash", "port"} {
+			if query.Get(key) != started.Get(key) {
+				t.Errorf("announce identity changed for %s", key)
+			}
+		}
+		if event != "started" && (query.Get("left") != "0" || query.Get("downloaded") != "8") {
+			t.Errorf("incorrect final statistics: %v", query)
+		}
+	}
+}
+
 func prepareRun(t *testing.T, args ...string) *bytes.Buffer {
 	t.Helper()
 	previousArgs, previousFlags := os.Args, flag.CommandLine
@@ -655,6 +799,37 @@ func TestRunPortRange(t *testing.T) {
 				}
 			} else if err == nil || !strings.Contains(err.Error(), "port") || os.IsNotExist(err) {
 				t.Errorf("invalid port %s should fail before file loading, got %v", tt.port, err)
+			}
+		})
+	}
+}
+
+func TestRunWorkerLimit(t *testing.T) {
+	missingPath := filepath.Join(t.TempDir(), "missing.torrent")
+	for _, tt := range []struct {
+		name  string
+		value string
+		valid bool
+	}{
+		{"default", "", true},
+		{"one worker", "1", true},
+		{"four workers", "4", true},
+		{"zero workers", "0", false},
+		{"negative workers", "-1", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			args := []string{"-torrent", missingPath, "-output", "output.bin"}
+			if tt.value != "" {
+				args = append(args, "-workers", tt.value)
+			}
+			prepareRun(t, args...)
+			err := run(25 * time.Millisecond)
+			if tt.valid {
+				if !os.IsNotExist(err) {
+					t.Errorf("valid worker limit did not reach file loading: %v", err)
+				}
+			} else if err == nil || os.IsNotExist(err) || !strings.Contains(err.Error(), "workers") {
+				t.Errorf("invalid worker limit did not fail before file loading: %v", err)
 			}
 		})
 	}

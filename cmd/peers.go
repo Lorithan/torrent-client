@@ -2,9 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/lorithan/torrent-client/internal/download"
+	"github.com/lorithan/torrent-client/internal/peer"
 )
 
 type peerQueue struct {
@@ -104,4 +110,58 @@ func waitForPeer(
 	defer cancel()
 
 	return peers.WaitNext(childCtx)
+}
+
+func preparePeerBatch(
+	ctx context.Context,
+	peers *peerQueue,
+	local peer.Handshake,
+	pieceCount int,
+	workerLimit int,
+) ([]*peer.Client, error) {
+	if workerLimit < 1 {
+		return nil, fmt.Errorf("worker limit must be greater than 0")
+	}
+
+	results := make([]*peer.Client, 0, workerLimit)
+
+	for range workerLimit {
+		if cancelled := ctx.Err(); cancelled != nil {
+			for _, client := range results {
+				client.Conn.Close()
+			}
+			return nil, cancelled
+		}
+
+		addr, next := peers.Next()
+		if !next {
+			break
+		}
+
+		client, err := preparePeer(addr, local, pieceCount)
+		if err != nil {
+			if _, ok := errors.AsType[*download.PeerError](err); ok {
+				log.Printf("error establishing peer: %v", err)
+
+				continue
+			} else {
+				for _, client := range results {
+					client.Conn.Close()
+				}
+
+				return nil, err
+			}
+		}
+
+		results = append(results, client)
+	}
+
+	if cancelled := ctx.Err(); cancelled != nil {
+		for _, client := range results {
+			client.Conn.Close()
+		}
+		return nil, cancelled
+	}
+
+	return results, nil
 }

@@ -422,3 +422,124 @@ func TestPeerWorkerHaveReportsNetworkFailureAndExits(t *testing.T) {
 		t.Error("failed have command changed session progress")
 	}
 }
+
+func TestPeerWorkerReportsIndependentUpdatedAvailability(t *testing.T) {
+	f := newWorkerTestFixture(t, -1)
+	f.client.Bitfield[0] = 0x80 // Initially advertises only piece zero.
+	replies, err := io.ReadAll(f.conn.incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The peer advertises piece one while the first download is in progress.
+	have := []byte{0, 0, 0, 5, byte(peer.MsgHave), 0, 0, 0, 1}
+	f.conn.incoming = bytes.NewReader(append(have, replies...))
+	jobs := make(chan workerCommand, 2)
+	jobs <- workerCommand{kind: commandDownload, index: 0}
+	jobs <- workerCommand{kind: commandDownload, index: 1}
+	close(jobs)
+	results := make(chan pieceResult, 2)
+	_, done := startPeerWorkerTest(t, f, jobs, results)
+	waitPeerWorkerTest(t, done)
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want two downloads", len(results))
+	}
+	first, second := <-results, <-results
+	for _, result := range []pieceResult{first, second} {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if !result.available.HasPiece(0) || !result.available.HasPiece(1) {
+			t.Errorf("piece %d result has stale availability: %x", result.index, result.available)
+		}
+	}
+	// Mutations after the worker exits isolate ownership checks from scheduling.
+	if err := first.available.SetPiece(2); err != nil {
+		t.Fatal(err)
+	}
+	if second.available.HasPiece(2) || f.client.Bitfield.HasPiece(2) {
+		t.Error("result snapshot shares storage with another result or peer state")
+	}
+	f.client.Bitfield[0] = 0
+	if !first.available.HasPiece(0) || !second.available.HasPiece(1) {
+		t.Error("later peer state mutation changed an earlier result snapshot")
+	}
+}
+
+func TestPeerWorkerAvailabilityThenDownload(t *testing.T) {
+	f := newWorkerTestFixture(t, -1)
+	f.client.Bitfield[0] = 0
+	replies, err := io.ReadAll(f.conn.incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.conn.incoming = bytes.NewReader(append(peer.NewHave(0).Serialize(), replies...))
+	jobs := make(chan workerCommand, 2)
+	jobs <- workerCommand{kind: commandAvailability}
+	jobs <- workerCommand{kind: commandDownload, index: 0}
+	close(jobs)
+	results := make(chan pieceResult, 2)
+	_, done := startPeerWorkerTest(t, f, jobs, results)
+	waitPeerWorkerTest(t, done)
+	if len(results) == 0 {
+		t.Fatal("availability command produced no result")
+	}
+	first := <-results
+	if first.workerID != 7 || first.kind != commandAvailability || first.err != nil || first.data != nil || !first.available.HasPiece(0) {
+		t.Fatalf("successful availability update reported incorrectly: %+v", first)
+	}
+	if len(results) != 1 || len(jobs) != 0 {
+		t.Fatal("worker did not continue to the next download after learning availability")
+	}
+	second := <-results
+	if second.kind != commandDownload || second.index != 0 || second.err != nil || !bytes.Equal(second.data, f.data[:4]) {
+		t.Fatalf("unexpected download after availability update: %+v", second)
+	}
+	if f.session.Stats().Downloaded != 4 || f.session.Stats().Left != 8 || len(f.writer.writes) != 0 {
+		t.Error("availability command changed progress or subsequent download was not counted")
+	}
+}
+
+func TestPeerWorkerAvailabilityFailureExits(t *testing.T) {
+	f := newWorkerTestFixture(t, -1)
+	f.conn.incoming = bytes.NewReader(nil)
+	jobs := make(chan workerCommand, 2)
+	jobs <- workerCommand{kind: commandAvailability}
+	jobs <- workerCommand{kind: commandDownload, index: 0}
+	results := make(chan pieceResult, 2)
+	_, done := startPeerWorkerTest(t, f, jobs, results)
+	waitPeerWorkerTest(t, done)
+	select {
+	case result := <-results:
+		var peerErr *PeerError
+		if result.workerID != 7 || result.kind != commandAvailability || result.data != nil || !errors.Is(result.err, io.EOF) || !errors.As(result.err, &peerErr) || !bytes.Equal(result.available, f.client.Bitfield) {
+			t.Fatalf("unexpected failed availability result: %+v", result)
+		}
+	default:
+		t.Fatal("worker did not report availability failure")
+	}
+	if len(jobs) != 1 || len(results) != 0 || f.conn.outgoing.Len() != 0 || f.session.Stats().Downloaded != 0 {
+		t.Error("failed availability command continued to a download or changed statistics")
+	}
+}
+
+func TestPeerWorkerAvailabilityCancellationInterruptsRead(t *testing.T) {
+	f := newWorkerTestFixture(t, -1)
+	local, remote := net.Pipe()
+	t.Cleanup(func() { local.Close(); remote.Close() })
+	observed := &workerIOTestConn{Conn: local, readStarted: make(chan struct{}), writeStarted: make(chan struct{})}
+	f.client.Conn = observed
+	jobs := make(chan workerCommand, 1)
+	jobs <- workerCommand{kind: commandAvailability}
+	results := make(chan pieceResult)
+	cancel, done := startPeerWorkerTest(t, f, jobs, results)
+	select {
+	case <-observed.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not start reading for availability")
+	}
+	cancel()
+	waitPeerWorkerTest(t, done)
+	if f.session.Stats().Downloaded != 0 || f.session.Stats().Left != 8 || len(f.writer.writes) != 0 {
+		t.Error("canceled availability wait changed progress")
+	}
+}

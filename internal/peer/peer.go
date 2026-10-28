@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"slices"
 	"time"
 )
 
@@ -138,6 +139,34 @@ func (c *Client) WaitForPiece(index int) error {
 		}
 
 		err = c.HandleMessage(message)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = c.Conn.SetDeadline(time.Time{})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Client) WaitForAvailabilityChange() error {
+	availabilitySnapshot := slices.Clone(c.Bitfield)
+
+	err := c.Conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if err != nil {
+		return err
+	}
+
+	for slices.Equal(availabilitySnapshot, c.Bitfield) {
+		m, err := ReadMessage(c.Conn)
+		if err != nil {
+			return err
+		}
+
+		err = c.HandleMessage(m)
 		if err != nil {
 			return err
 		}

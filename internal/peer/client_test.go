@@ -383,3 +383,73 @@ func TestWaitForPieceRejectsInvalidIndexBeforeIO(t *testing.T) {
 		}
 	}
 }
+
+func TestWaitForAvailabilityChange(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		initial Bitfield
+		prefix  []byte
+		change  []byte
+		want    Bitfield
+	}{
+		{"have extends known availability", Bitfield{0x80}, nil, NewHave(1).Serialize(), Bitfield{0xc0}},
+		{"initial bitfield", Bitfield{0}, nil, (Message{ID: MsgBitfield, Payload: []byte{0x40}}).Serialize(), Bitfield{0x40}},
+		{"skip keepalive unchoke and duplicate have", Bitfield{0x80}, append([]byte{0, 0, 0, 0, 0, 0, 0, 1, 1}, NewHave(0).Serialize()...), NewHave(1).Serialize(), Bitfield{0xc0}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			trailing := NewHave(2).Serialize()
+			wire := append(append(append([]byte(nil), tt.prefix...), tt.change...), trailing...)
+			source := bytes.NewReader(wire)
+			conn := &blockDeadlineConn{exchangeTestConn: exchangeTestConn{reader: iotest.OneByteReader(source)}}
+			c := &Client{Conn: conn, Choked: true, PieceCount: 8, Bitfield: append(Bitfield(nil), tt.initial...)}
+			before := time.Now()
+			if err := c.WaitForAvailabilityChange(); err != nil {
+				t.Fatal(err)
+			}
+			after := time.Now()
+			if !bytes.Equal(c.Bitfield, tt.want) || source.Len() != len(trailing) {
+				t.Errorf("availability = %x, unread bytes = %d; want %x and %d", c.Bitfield, source.Len(), tt.want, len(trailing))
+			}
+			if len(conn.deadlines) != 2 || conn.deadlines[0].Before(before.Add(30*time.Second)) || conn.deadlines[0].After(after.Add(30*time.Second)) || !conn.deadlines[1].IsZero() {
+				t.Errorf("deadline calls = %v; want one thirty-second deadline and one clear", conn.deadlines)
+			}
+			if len(conn.events) == 0 || conn.events[0] != "set" || conn.closed {
+				t.Error("deadline did not precede I/O or wait closed caller-owned connection")
+			}
+		})
+	}
+}
+
+func TestWaitForAvailabilityChangeErrors(t *testing.T) {
+	readErr, deadlineErr := errors.New("read failed"), errors.New("deadline failed")
+	for _, tt := range []struct {
+		name   string
+		reader io.Reader
+		failAt int
+		cause  error
+	}{
+		{"set deadline", bytes.NewReader(nil), 1, deadlineErr},
+		{"clear deadline", bytes.NewReader(NewHave(1).Serialize()), 2, deadlineErr},
+		{"read failure", iotest.ErrReader(readErr), 0, readErr},
+		{"disconnect", bytes.NewReader(nil), 0, io.EOF},
+		{"unchanged bitfield then disconnect", bytes.NewReader((Message{ID: MsgBitfield, Payload: []byte{0x80}}).Serialize()), 0, io.EOF},
+		{"out of range have", bytes.NewReader(NewHave(8).Serialize()), 0, nil},
+		{"malformed have", bytes.NewReader((Message{ID: MsgHave, Payload: []byte{1}}).Serialize()), 0, nil},
+		{"malformed bitfield", bytes.NewReader((Message{ID: MsgBitfield, Payload: []byte{0x80, 0}}).Serialize()), 0, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			conn := &blockDeadlineConn{exchangeTestConn: exchangeTestConn{reader: tt.reader}, failAt: tt.failAt, err: deadlineErr}
+			c := &Client{Conn: conn, PieceCount: 8, Bitfield: Bitfield{0x80}}
+			err := c.WaitForAvailabilityChange()
+			if err == nil || (tt.cause != nil && !errors.Is(err, tt.cause)) {
+				t.Fatalf("error = %v, want failure preserving %v", err, tt.cause)
+			}
+			if tt.failAt == 1 && conn.reads != 0 {
+				t.Error("read after failing to set deadline")
+			}
+			if conn.closed {
+				t.Error("availability wait closed caller-owned connection")
+			}
+		})
+	}
+}

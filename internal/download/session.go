@@ -1,6 +1,7 @@
 package download
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -17,8 +18,8 @@ type Stats struct {
 	Left       int64
 }
 
-// Session retains progress across sequential peer attempts. Stats may be called
-// during a transfer; other session operations still require a single owner.
+// Session retains progress across peer attempts and worker groups. Stats may be
+// called during a transfer; completion tracking and output have a single owner.
 type Session struct {
 	torrent        *torrent.TorrentFile
 	dest           io.WriterAt
@@ -128,6 +129,74 @@ func (s *Session) DownloadFrom(client *peer.Client) error {
 	}
 
 	return nil
+}
+
+// DownloadFromPeers runs one bounded batch of already-connected peers. It takes
+// ownership of every supplied connection, including on validation errors, and
+// cancels and joins all started workers before returning. Callers must not run
+// DownloadFrom or DownloadFromPeers concurrently on the same session.
+func (s *Session) DownloadFromPeers(
+	ctx context.Context,
+	clients []*peer.Client,
+	workerLimit int,
+) error {
+	coordinator := newCoordinatorForSession(s)
+
+	childCtx, cancel := context.WithCancel(ctx)
+
+	defer func() {
+		cancel()
+
+		for _, client := range clients {
+			if client != nil && client.Conn != nil {
+				client.Conn.Close()
+			}
+		}
+
+		coordinator.workerWG.Wait()
+	}()
+
+	if workerLimit < 1 {
+		return fmt.Errorf("worker limit must be positive")
+	}
+
+	if len(clients) > workerLimit {
+		return fmt.Errorf("more clients than workers")
+	}
+
+	seen := make(map[*peer.Client]struct{})
+	for _, client := range clients {
+		if client == nil || client.Conn == nil {
+			return fmt.Errorf("uninitialized client connection")
+		}
+
+		if _, exists := seen[client]; exists {
+			return fmt.Errorf("duplicate client connection")
+		}
+
+		if client.PieceCount != len(s.torrent.Pieces) {
+			return fmt.Errorf("mismatch piece count.")
+		}
+
+		seen[client] = struct{}{}
+	}
+
+	if cancelled := childCtx.Err(); cancelled != nil {
+		return cancelled
+	}
+
+	if s.Complete() {
+		return nil
+	}
+
+	for index, client := range clients {
+		err := coordinator.startWorker(childCtx, s, index, client)
+		if err != nil {
+			return err
+		}
+	}
+
+	return coordinator.run(childCtx, s)
 }
 
 func (s *Session) Complete() bool {

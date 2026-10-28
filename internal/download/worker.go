@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/lorithan/torrent-client/internal/peer"
@@ -14,6 +15,7 @@ type workerCommandKind uint8
 const (
 	commandDownload workerCommandKind = iota
 	commandHave
+	commandAvailability
 )
 
 type workerCommand struct {
@@ -22,11 +24,12 @@ type workerCommand struct {
 }
 
 type pieceResult struct {
-	workerID int
-	index    int
-	kind     workerCommandKind
-	data     []byte
-	err      error
+	workerID  int
+	index     int
+	kind      workerCommandKind
+	data      []byte
+	available peer.Bitfield
+	err       error
 }
 
 func (s *Session) runPeerWorker(
@@ -81,9 +84,19 @@ func (s *Session) runPeerWorker(
 			}
 
 			result.err = err
+		case commandAvailability:
+			err := client.WaitForAvailabilityChange()
+			if err != nil {
+				result.err = &PeerError{
+					Op:  "wait for availability",
+					Err: err,
+				}
+			}
 		default:
 			result.err = fmt.Errorf("unsupported command type: %d", job.kind)
 		}
+
+		result.available = slices.Clone(client.Bitfield)
 
 		select {
 		case <-ctx.Done():
