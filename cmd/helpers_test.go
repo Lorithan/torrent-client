@@ -168,6 +168,10 @@ type fallbackTestWriter struct {
 	err   error
 }
 
+func (w *fallbackTestWriter) ReadAt(p []byte, offset int64) (int, error) {
+	return bytes.NewReader(w.data).ReadAt(p, offset)
+}
+
 func (w *fallbackTestWriter) WriteAt(p []byte, offset int64) (int, error) {
 	w.calls++
 	if w.err != nil {

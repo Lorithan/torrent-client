@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/lorithan/torrent-client/internal/download"
@@ -20,17 +22,20 @@ import (
 
 func main() {
 	const waitTimeout = 45 * time.Second // Maybe later this can be a user configured param
-	if err := run(waitTimeout); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, waitTimeout); err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("error: %v", err)
 		os.Exit(1)
 	}
 }
 
-func run(waitTimeout time.Duration) error {
+func run(ctx context.Context, waitTimeout time.Duration) error {
 	torrentPath := flag.String("torrent", "", "location of torrent file")
 	output := flag.String("output", "", "destination of download")
 	nPort := flag.Int("port", 0, "port number to listen on")
 	workers := flag.Int("workers", 4, "number of workers dedicated to downloading")
+	seed := flag.Bool("seed", true, "continue seed the torrent after download is complete")
 
 	flag.Parse()
 
@@ -76,7 +81,7 @@ func run(waitTimeout time.Duration) error {
 
 	log.Printf("current addr: %d", addr.Port)
 
-	file, err := os.OpenFile(*output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	file, err := os.OpenFile(*output, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return err
 	}
@@ -137,18 +142,12 @@ func run(waitTimeout time.Duration) error {
 		}
 	}()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	updatesDone := make(chan struct{})
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	refreshPeer := make(chan struct{}, 1)
 	minDelay := 5 * time.Second
-	go func() {
-		defer close(updatesDone)
-		runTrackerUpdates(ctx, refreshPeer, response.Interval, minDelay, regularAnnounce)
-	}()
-	stopUpdates := func() {
-		cancel()
-		<-updatesDone
-	}
+	stopUpdates := startTrackerUpdates(ctx, refreshPeer, response.Interval, minDelay, regularAnnounce)
 	defer stopUpdates()
 
 	log.Printf("interval: %s, peers: %v", response.Interval, response.Peers)
@@ -158,14 +157,29 @@ func run(waitTimeout time.Duration) error {
 		PeerID:   peerID,
 	}
 
+	incomingCtx, cancelIncoming := context.WithCancel(ctx)
+	var incomingErr error
+	incomingDone := make(chan struct{})
+	go func() {
+		defer close(incomingDone)
+		incomingErr = serveIncomingPeers(incomingCtx, listener, local, len(torrentData.Pieces), session, 8)
+		if incomingErr != nil && !errors.Is(incomingErr, context.Canceled) {
+			cancel()
+		}
+	}()
+	stopIncoming := func() {
+		cancelIncoming()
+		<-incomingDone
+	}
+	defer stopIncoming()
+
 	err = downloadFromPeers(ctx, refreshPeer, peers, local, len(torrentData.Pieces), *workers, session, waitTimeout)
 	stopUpdates()
 	if err != nil {
-		return err
-	}
-
-	err = file.Close()
-	if err != nil {
+		stopIncoming()
+		if incomingErr != nil && !errors.Is(incomingErr, context.Canceled) {
+			return incomingErr
+		}
 		return err
 	}
 
@@ -186,7 +200,26 @@ func run(waitTimeout time.Duration) error {
 
 	log.Printf("download complete")
 
-	return nil
+	if *seed {
+		stopSeedingUpdates := startTrackerUpdates(ctx, refreshPeer, response.Interval, minDelay, regularAnnounce)
+		defer stopSeedingUpdates()
+		log.Print("seeding started")
+
+		<-ctx.Done()
+		stopSeedingUpdates()
+	}
+
+	stopIncoming()
+	if incomingErr != nil && !errors.Is(incomingErr, context.Canceled) {
+		return incomingErr
+	}
+
+	err = file.Close()
+	if err != nil {
+		return err
+	}
+
+	return ctx.Err()
 }
 
 func preparePeer(addr net.TCPAddr, local peer.Handshake, pieceCount int) (*peer.Client, error) {

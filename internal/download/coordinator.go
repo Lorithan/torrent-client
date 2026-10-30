@@ -72,8 +72,9 @@ func newCoordinator(pieceCount int) *coordinator {
 func newCoordinatorForSession(session *Session) *coordinator {
 	c := newCoordinator(len(session.torrent.Pieces))
 
+	completed := session.Availability()
 	for index := range session.torrent.Pieces {
-		if session.completed.HasPiece(index) {
+		if completed.HasPiece(index) {
 			c.scheduler.states[index] = pieceComplete
 			c.scheduler.completedCount++
 		}
@@ -188,7 +189,7 @@ func (c *coordinator) handleSuccess(
 	if result.err != nil {
 		return result.err
 	}
-	if session.completed.HasPiece(result.index) {
+	if session.HasPiece(result.index) {
 		return fmt.Errorf("piece %d already complete", result.index)
 	}
 
@@ -207,15 +208,10 @@ func (c *coordinator) handleSuccess(
 		return err
 	}
 
-	err = session.completed.SetPiece(result.index)
+	err = session.markComplete(result.index)
 	if err != nil {
 		return err
 	}
-	session.completedCount++
-
-	session.statsMu.Lock()
-	session.stats.Left -= int64(len(result.data))
-	session.statsMu.Unlock()
 
 	worker.phase = workerAnnouncing
 	worker.available = result.available

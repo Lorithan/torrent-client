@@ -81,3 +81,25 @@ func ExchangeHandshake(conn net.Conn, local Handshake) (*Handshake, error) {
 
 	return received, nil
 }
+
+func AcceptHandshake(conn net.Conn, local Handshake) (*Handshake, error) {
+	remote, err := ReadHandshake(conn)
+	if err != nil {
+		return nil, err
+	}
+
+	if remote.InfoHash != local.InfoHash {
+		return nil, fmt.Errorf("mismatch info hashes")
+	}
+
+	bytes := local.Serialize()
+	n, err := conn.Write(bytes)
+	if err != nil {
+		return nil, err
+	}
+	if n < len(bytes) {
+		return nil, io.ErrShortWrite
+	}
+
+	return remote, nil
+}

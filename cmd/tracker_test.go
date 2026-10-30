@@ -92,7 +92,7 @@ func TestRunDiscoversPeerAfterEmptyInitialAnnounce(t *testing.T) {
 	prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
 	// Allow the production five-second announce cooldown, without waiting for
 	// the tracker's thirty-minute periodic interval.
-	if err := run(10 * time.Second); err != nil {
+	if err := run(context.Background(), 10*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-peerDone; err != nil {
@@ -203,7 +203,7 @@ func TestRunRediscoversPeerAfterTransferFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
-	if err := run(10 * time.Second); err != nil {
+	if err := run(context.Background(), 10*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	for _, done := range []<-chan error{firstDone, secondDone} {
@@ -329,7 +329,7 @@ func TestRunJoinsPeriodicAnnounceBeforeLifecycleEvents(t *testing.T) {
 	}
 	prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
 	runDone := make(chan error, 1)
-	go func() { runDone <- run(25 * time.Millisecond) }()
+	go func() { runDone <- run(context.Background(), 25*time.Millisecond) }()
 	// Join run before prepareRun restores the process-wide flags and logger.
 	var result error
 	joined := false

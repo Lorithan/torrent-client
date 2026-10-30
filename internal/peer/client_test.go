@@ -31,7 +31,7 @@ func TestClientHandleMessage(t *testing.T) {
 		{"out of range have", &Message{ID: MsgHave, Payload: []byte{0, 0, 0, 10}}, true, true, Bitfield{0x80, 0}, true},
 		{"wrong bitfield length", &Message{ID: MsgBitfield, Payload: []byte{0x80}}, true, true, Bitfield{0x80, 0}, true},
 		{"nonzero padding", &Message{ID: MsgBitfield, Payload: []byte{0x80, 1}}, true, true, Bitfield{0x80, 0}, true},
-		{"unhandled message", &Message{ID: MsgInterested}, true, true, Bitfield{0x80, 0}, false},
+		{"unhandled message", &Message{ID: MsgCancel}, true, true, Bitfield{0x80, 0}, false},
 		{"unknown ID", &Message{ID: MessageID(255)}, true, true, Bitfield{0x80, 0}, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -51,6 +51,44 @@ func TestClientHandleMessage(t *testing.T) {
 				t.Error("handler modified message payload")
 			}
 		})
+	}
+}
+
+func TestClientHandleInterest(t *testing.T) {
+	for _, initial := range []bool{false, true} {
+		for _, choking := range []bool{false, true} {
+			for _, id := range []MessageID{MsgInterested, MsgNotInterested} {
+				for _, malformed := range []bool{false, true} {
+					t.Run(fmt.Sprintf("initial=%t/choking=%t/id=%d/malformed=%t", initial, choking, id, malformed), func(t *testing.T) {
+						c := &Client{
+							PeerInterested: initial, AmChoking: choking, Choked: !choking,
+							PieceCount: 8, Bitfield: Bitfield{0x80},
+						}
+						m := &Message{ID: id}
+						if malformed {
+							m.Payload = []byte{42}
+						}
+						err := c.HandleMessage(m)
+						if (err != nil) != malformed {
+							t.Fatalf("error=%v, want error=%t", err, malformed)
+						}
+						want := id == MsgInterested
+						if malformed {
+							want = initial
+						}
+						if c.PeerInterested != want {
+							t.Errorf("PeerInterested=%t, want %t", c.PeerInterested, want)
+						}
+						if c.AmChoking != choking || c.Choked != !choking || c.PieceCount != 8 || !bytes.Equal(c.Bitfield, []byte{0x80}) {
+							t.Error("interest message changed unrelated state")
+						}
+						if malformed && !bytes.Equal(m.Payload, []byte{42}) {
+							t.Error("handler changed message payload")
+						}
+					})
+				}
+			}
+		}
 	}
 }
 
@@ -147,6 +185,159 @@ func TestClientSendMessageWriteErrors(t *testing.T) {
 	}
 }
 
+func TestClientSetChoking(t *testing.T) {
+	for _, initial := range []bool{false, true} {
+		for _, choking := range []bool{false, true} {
+			t.Run(fmt.Sprintf("initial=%t/choking=%t", initial, choking), func(t *testing.T) {
+				var outgoing bytes.Buffer
+				conn := &exchangeTestConn{writer: &outgoing}
+				c := &Client{Conn: conn, AmChoking: initial, Choked: !choking, PeerInterested: true, PieceCount: 8, Bitfield: Bitfield{0x80}}
+				if err := c.SetChoking(choking); err != nil {
+					t.Fatal(err)
+				}
+				id := byte(1) // Unchoke on the wire.
+				if choking {
+					id = 0
+				}
+				if !bytes.Equal(outgoing.Bytes(), []byte{0, 0, 0, 1, id}) {
+					t.Errorf("wire=%x", outgoing.Bytes())
+				}
+				if c.AmChoking != choking {
+					t.Errorf("AmChoking=%t, want %t", c.AmChoking, choking)
+				}
+				if c.Choked != !choking || !c.PeerInterested || c.PieceCount != 8 || !bytes.Equal(c.Bitfield, []byte{0x80}) {
+					t.Error("changed unrelated state")
+				}
+				if conn.closed || conn.reads != 0 {
+					t.Error("closed or read from caller's connection")
+				}
+			})
+		}
+	}
+}
+
+func TestClientSetChokingSendFailurePreservesState(t *testing.T) {
+	wantErr := errors.New("choking message write failed")
+	for _, initial := range []bool{false, true} {
+		for _, partial := range []bool{false, true} {
+			t.Run(fmt.Sprintf("initial=%t/partial=%t", initial, partial), func(t *testing.T) {
+				var writer io.Writer = exchangeErrorWriter{err: wantErr}
+				if partial {
+					writer = &sendPartialErrorWriter{err: wantErr}
+				}
+				conn := &exchangeTestConn{writer: writer}
+				c := &Client{Conn: conn, AmChoking: initial, Choked: true, PeerInterested: true}
+				if err := c.SetChoking(!initial); !errors.Is(err, wantErr) {
+					t.Errorf("error=%v, want %v", err, wantErr)
+				}
+				if c.AmChoking != initial || !c.Choked || !c.PeerInterested {
+					t.Error("failed send changed state")
+				}
+				if conn.closed || conn.reads != 0 {
+					t.Error("failed send closed or read from caller's connection")
+				}
+			})
+		}
+	}
+}
+
+func TestClientSendBitfield(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		count     int
+		available Bitfield
+		want      []byte
+	}{
+		{"partial byte", 10, Bitfield{0xa0, 0x40}, []byte{0, 0, 0, 3, 5, 0xa0, 0x40}},
+		{"whole byte", 8, Bitfield{0xff}, []byte{0, 0, 0, 2, 5, 0xff}},
+		{"no completed pieces", 8, Bitfield{0}, []byte{0, 0, 0, 2, 5, 0}},
+		{"empty torrent", 0, nil, []byte{0, 0, 0, 1, 5}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var outgoing bytes.Buffer
+			conn := &exchangeTestConn{writer: &outgoing}
+			remote := NewBitfield(tc.count)
+			if tc.count > 0 {
+				remote[0] = 0x80
+			}
+			beforeRemote := bytes.Clone(remote)
+			beforeAvailable := bytes.Clone(tc.available)
+			c := &Client{Conn: conn, PieceCount: tc.count, Bitfield: remote, Choked: true, AmChoking: true, PeerInterested: true}
+			if err := c.SendBitfield(tc.available); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(outgoing.Bytes(), tc.want) {
+				t.Errorf("wire=%x, want %x", outgoing.Bytes(), tc.want)
+			}
+			if !bytes.Equal(c.Bitfield, beforeRemote) || !bytes.Equal(tc.available, beforeAvailable) {
+				t.Error("sending changed local or remote availability")
+			}
+			if !c.Choked || !c.AmChoking || !c.PeerInterested || c.PieceCount != tc.count {
+				t.Error("sending changed connection state")
+			}
+			if conn.closed || conn.reads != 0 {
+				t.Error("sending closed or read from connection")
+			}
+		})
+	}
+}
+
+func TestClientSendBitfieldRejectsInvalidAvailability(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		count     int
+		available Bitfield
+	}{
+		{"too short", 10, Bitfield{0x80}},
+		{"too long", 8, Bitfield{0x80, 0}},
+		{"nonzero padding", 10, Bitfield{0x80, 1}},
+		{"negative count", -1, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var outgoing bytes.Buffer
+			conn := &exchangeTestConn{writer: &outgoing}
+			c := &Client{Conn: conn, PieceCount: tc.count, Bitfield: Bitfield{0x80}}
+			before := bytes.Clone(tc.available)
+			if err := c.SendBitfield(tc.available); err == nil {
+				t.Error("invalid availability returned nil error")
+			}
+			if outgoing.Len() != 0 {
+				t.Error("invalid availability was sent")
+			}
+			if !bytes.Equal(tc.available, before) || !bytes.Equal(c.Bitfield, []byte{0x80}) {
+				t.Error("validation changed availability")
+			}
+			if conn.closed || conn.reads != 0 {
+				t.Error("validation closed or read from connection")
+			}
+		})
+	}
+}
+
+func TestClientSendBitfieldPropagatesWriteErrors(t *testing.T) {
+	wantErr := errors.New("bitfield write failed")
+	for _, partial := range []bool{false, true} {
+		t.Run(fmt.Sprintf("partial=%t", partial), func(t *testing.T) {
+			var writer io.Writer = exchangeErrorWriter{err: wantErr}
+			if partial {
+				writer = &sendPartialErrorWriter{err: wantErr}
+			}
+			conn := &exchangeTestConn{writer: writer}
+			c := &Client{Conn: conn, PieceCount: 8, Bitfield: Bitfield{0x40}, AmChoking: true}
+			available := Bitfield{0x80}
+			if err := c.SendBitfield(available); !errors.Is(err, wantErr) {
+				t.Errorf("error=%v, want %v", err, wantErr)
+			}
+			if !bytes.Equal(c.Bitfield, []byte{0x40}) || !bytes.Equal(available, []byte{0x80}) || !c.AmChoking {
+				t.Error("failed send changed state")
+			}
+			if conn.closed || conn.reads != 0 {
+				t.Error("failed send closed or read from connection")
+			}
+		})
+	}
+}
+
 func TestNewClient(t *testing.T) {
 	conn, other := net.Pipe()
 	t.Cleanup(func() { conn.Close(); other.Close() })
@@ -167,6 +358,9 @@ func TestNewClient(t *testing.T) {
 			}
 			if !got.Choked {
 				t.Error("new client must start choked")
+			}
+			if !got.AmChoking || got.PeerInterested {
+				t.Errorf("new client upload state: AmChoking=%t, PeerInterested=%t; want true, false", got.AmChoking, got.PeerInterested)
 			}
 			if !bytes.Equal(got.Bitfield, make([]byte, tt.bytes)) {
 				t.Errorf("bitfield = %x, want %d zero bytes", got.Bitfield, tt.bytes)

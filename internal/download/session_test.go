@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"net"
 	"sync"
 	"testing"
@@ -210,6 +211,159 @@ func TestSessionStorePiecePreservesWriteErrors(t *testing.T) {
 				t.Error("failed storage write changed completion")
 			}
 		})
+	}
+}
+
+func TestSessionMarkCompleteCountsActualPieceSizeOnce(t *testing.T) {
+	tf := &torrent.TorrentFile{Length: 10, PieceLength: 4, Pieces: make([][20]byte, 3)}
+	dst := &downloadTestWriter{}
+	s, err := NewSession(tf, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.stats.Downloaded = 20
+	if err := s.markComplete(2); err != nil {
+		t.Fatal(err)
+	}
+	if s.completedCount != 1 || !s.completed.HasPiece(2) || s.Stats().Left != 8 || s.Stats().Downloaded != 20 {
+		t.Fatalf("final-piece accounting = %+v, count %d; want left 8, downloaded 20, count 1", s.Stats(), s.completedCount)
+	}
+	beforeStats, beforeBits := s.Stats(), bytes.Clone(s.completed)
+	for _, index := range []int{2, -1, 3} {
+		if err := s.markComplete(index); err == nil {
+			t.Errorf("invalid or duplicate completion %d succeeded", index)
+		}
+		if s.completedCount != 1 || s.Stats() != beforeStats || !bytes.Equal(s.completed, beforeBits) {
+			t.Error("rejected completion changed progress")
+		}
+	}
+	for _, index := range []int{0, 1} {
+		if err := s.markComplete(index); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !s.Complete() || s.completedCount != 3 || s.Stats().Left != 0 || s.Stats().Downloaded != 20 || len(dst.writes) != 0 {
+		t.Error("completion bookkeeping wrote data or failed to count all pieces once")
+	}
+}
+
+func TestSessionMarkCompleteSerializesDuplicateUpdates(t *testing.T) {
+	tf := &torrent.TorrentFile{Length: 1, PieceLength: 1, Pieces: make([][20]byte, 1)}
+	s, err := NewSession(tf, &downloadTestWriter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const callers = 32
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	var workers sync.WaitGroup
+	for range callers {
+		workers.Go(func() { <-start; results <- s.markComplete(0) })
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	successes := 0
+	for err := range results {
+		if err == nil {
+			successes++
+		}
+	}
+	if successes != 1 || s.completedCount != 1 || s.Stats().Left != 0 || !s.Complete() {
+		t.Errorf("duplicate updates: successes %d, count %d, stats %+v", successes, s.completedCount, s.Stats())
+	}
+}
+
+func TestSessionAvailabilitySnapshotsAreIndependent(t *testing.T) {
+	tf := &torrent.TorrentFile{Length: 36, PieceLength: 4, Pieces: make([][20]byte, 9)}
+	s, err := NewSession(tf, &downloadTestWriter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := s.Availability()
+	if err := s.markComplete(8); err != nil {
+		t.Fatal(err)
+	}
+	current := s.Availability()
+	if original.HasPiece(8) || !current.HasPiece(8) || !s.HasPiece(8) || s.CompletedPieces() != 1 {
+		t.Fatal("progress queries did not distinguish old and new snapshots")
+	}
+	current[0], current[1] = 255, 255
+	if s.HasPiece(0) || !s.HasPiece(8) || !bytes.Equal(s.Availability(), []byte{0, 0x80}) || s.CompletedPieces() != 1 {
+		t.Error("caller mutation of a snapshot changed session state")
+	}
+	for _, index := range []int{-1, 9, 10, 15, 16, int(^uint(0) >> 1)} {
+		if s.HasPiece(index) {
+			t.Errorf("nonexistent piece %d reported available", index)
+		}
+	}
+}
+
+func TestSessionProgressQueriesDuringCompletion(t *testing.T) {
+	const pieceCount = 65
+	tf := &torrent.TorrentFile{Length: pieceCount, PieceLength: 1, Pieces: make([][20]byte, pieceCount)}
+	s, err := NewSession(tf, &downloadTestWriter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	errorsSeen := make(chan error, 4)
+	var readers, ready sync.WaitGroup
+	for range 4 {
+		ready.Add(1)
+		readers.Go(func() {
+			ready.Done()
+			lastCount, lastLeft := 0, int64(pieceCount)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				snapshot := s.Availability()
+				if err := snapshot.Validate(pieceCount); err != nil {
+					errorsSeen <- err
+					return
+				}
+				count := s.CompletedPieces()
+				stats := s.Stats()
+				if count < lastCount || count > pieceCount || stats.Left > lastLeft || stats.Left < 0 {
+					errorsSeen <- fmt.Errorf("progress regressed: count %d, stats %+v", count, stats)
+					return
+				}
+				lastCount, lastLeft = count, stats.Left
+				for index := range pieceCount {
+					if snapshot.HasPiece(index) && !s.HasPiece(index) {
+						errorsSeen <- fmt.Errorf("completed piece %d disappeared", index)
+						return
+					}
+				}
+				if s.Complete() && s.Stats().Left != 0 {
+					errorsSeen <- fmt.Errorf("complete session retained remaining bytes")
+					return
+				}
+			}
+		})
+	}
+	ready.Wait()
+	for index := range pieceCount {
+		if err := s.markComplete(index); err != nil {
+			t.Error(err)
+		}
+	}
+	close(stop)
+	readers.Wait()
+	close(errorsSeen)
+	for err := range errorsSeen {
+		t.Error(err)
+	}
+	snapshot := s.Availability()
+	completed := 0
+	for _, value := range snapshot {
+		completed += bits.OnesCount8(value)
+	}
+	if completed != pieceCount || s.CompletedPieces() != pieceCount || !s.Complete() || s.Stats().Left != 0 {
+		t.Error("final progress queries disagree after all pieces complete")
 	}
 }
 
@@ -459,9 +613,9 @@ func TestSessionStatsReturnsSnapshot(t *testing.T) {
 	}
 	// Snapshots already returned to a caller must not become live views of the
 	// session when its counters change later.
-	s.statsMu.Lock()
+	s.stateMu.Lock()
 	s.stats.Uploaded = 10
-	s.statsMu.Unlock()
+	s.stateMu.Unlock()
 	if original.Uploaded != 0 {
 		t.Error("session changes mutated an earlier snapshot")
 	}

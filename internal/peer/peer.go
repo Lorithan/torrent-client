@@ -14,11 +14,13 @@ const handshakeTimeout = 10 * time.Second
 const dialTimeout = 10 * time.Second
 
 type Client struct {
-	Conn       net.Conn
-	Handshake  Handshake
-	Bitfield   Bitfield
-	Choked     bool
-	PieceCount int
+	Conn           net.Conn
+	Handshake      Handshake
+	Bitfield       Bitfield
+	Choked         bool
+	AmChoking      bool
+	PeerInterested bool
+	PieceCount     int
 }
 
 func NewClient(conn net.Conn, remote Handshake, pieceCount int) (*Client, error) {
@@ -40,6 +42,7 @@ func NewClient(conn net.Conn, remote Handshake, pieceCount int) (*Client, error)
 		Handshake:  remote,
 		Bitfield:   bitfield,
 		Choked:     true,
+		AmChoking:  true,
 		PieceCount: pieceCount,
 	}
 
@@ -84,6 +87,16 @@ func (c *Client) HandleMessage(m *Message) error {
 
 		copy(c.Bitfield, bitfield)
 		log.Printf("has piece 0: %v", c.Bitfield.HasPiece(0))
+	case MsgInterested:
+		if len(m.Payload) != 0 {
+			return fmt.Errorf("interested msg expects empty paylooad")
+		}
+		c.PeerInterested = true
+	case MsgNotInterested:
+		if len(m.Payload) != 0 {
+			return fmt.Errorf("not interested msg expects empty paylooad")
+		}
+		c.PeerInterested = false
 	}
 
 	return nil
@@ -92,6 +105,19 @@ func (c *Client) HandleMessage(m *Message) error {
 func (c *Client) SendMessage(m Message) error {
 	_, err := c.Conn.Write(m.Serialize())
 	return err
+}
+
+func (c *Client) SendBitfield(available Bitfield) error {
+	err := available.Validate(c.PieceCount)
+	if err != nil {
+		return err
+	}
+
+	msg := Message{
+		ID:      MsgBitfield,
+		Payload: available,
+	}
+	return c.SendMessage(msg)
 }
 
 func (c *Client) WaitForUnchoke() error {
@@ -254,6 +280,27 @@ func (c *Client) DownloadBlock(index, begin, length uint32) ([]byte, error) {
 
 		return pieceBlock.Data, nil
 	}
+}
+
+func (c *Client) SetChoking(choking bool) error {
+	var msgID MessageID
+	if choking {
+		msgID = MsgChoke
+	} else {
+		msgID = MsgUnchoke
+	}
+
+	msg := Message{
+		ID: msgID,
+	}
+
+	err := c.SendMessage(msg)
+	if err != nil {
+		return err
+	}
+
+	c.AmChoking = choking
+	return nil
 }
 
 func Connect(addr net.TCPAddr, local Handshake) (net.Conn, *Handshake, error) {

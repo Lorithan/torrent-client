@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -126,10 +127,19 @@ type completionTestWriterFunc func([]byte, int64) (int, error)
 
 func (f completionTestWriterFunc) WriteAt(p []byte, offset int64) (int, error) { return f(p, offset) }
 
+// These write-only fixtures deliberately fail if a download starts reading storage.
+func (f completionTestWriterFunc) ReadAt([]byte, int64) (int, error) {
+	return 0, errors.New("unexpected read from write-only test fixture")
+}
+
 type downloadTestWriter struct {
 	writes []downloadWrite
 	failAt int
 	err    error
+}
+
+func (w *downloadTestWriter) ReadAt([]byte, int64) (int, error) {
+	return 0, errors.New("unexpected read from write-only test fixture")
 }
 
 func (w *downloadTestWriter) WriteAt(p []byte, offset int64) (int, error) {

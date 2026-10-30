@@ -85,9 +85,9 @@ func (s *Session) DownloadPiece(client *peer.Client, index int) ([]byte, error) 
 			}
 		}
 
-		s.statsMu.Lock()
+		s.stateMu.Lock()
 		s.stats.Downloaded += int64(len(block))
-		s.statsMu.Unlock()
+		s.stateMu.Unlock()
 
 		piece = append(piece, block...)
 		offset += int64(len(block))

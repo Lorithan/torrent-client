@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"slices"
 	"sync"
 	"time"
 
@@ -22,14 +23,14 @@ type Stats struct {
 // called during a transfer; completion tracking and output have a single owner.
 type Session struct {
 	torrent        *torrent.TorrentFile
-	dest           io.WriterAt
+	dest           Storage
 	completed      peer.Bitfield
 	completedCount int
 	stats          Stats
-	statsMu        sync.Mutex // Protects stats, not the complete session state.
+	stateMu        sync.Mutex // Protects completion state and stats
 }
 
-func NewSession(tf *torrent.TorrentFile, dst io.WriterAt) (*Session, error) {
+func NewSession(tf *torrent.TorrentFile, dst Storage) (*Session, error) {
 	if tf.PieceLength < 1 {
 		return nil, fmt.Errorf("piece length needs to be greater than 0")
 	}
@@ -63,8 +64,8 @@ func NewSession(tf *torrent.TorrentFile, dst io.WriterAt) (*Session, error) {
 }
 
 func (s *Session) DownloadFrom(client *peer.Client) error {
-	for s.completedCount < len(s.torrent.Pieces) {
-		index, found := SelectPiece(client.Bitfield, s.completed, len(s.torrent.Pieces))
+	for !s.Complete() {
+		index, found := SelectPiece(client.Bitfield, s.Availability(), len(s.torrent.Pieces))
 		if !found {
 			err := client.Conn.SetDeadline(time.Now().Add(30 * time.Second))
 			if err != nil {
@@ -89,7 +90,7 @@ func (s *Session) DownloadFrom(client *peer.Client) error {
 						Err: err,
 					}
 				}
-				index, found = SelectPiece(client.Bitfield, s.completed, len(s.torrent.Pieces))
+				index, found = SelectPiece(client.Bitfield, s.Availability(), len(s.torrent.Pieces))
 			}
 			err = client.Conn.SetDeadline(time.Time{})
 			if err != nil {
@@ -110,22 +111,17 @@ func (s *Session) DownloadFrom(client *peer.Client) error {
 			return err
 		}
 
-		err = s.completed.SetPiece(index)
+		err = s.markComplete(index)
 		if err != nil {
 			return err
 		}
-		s.completedCount++
-
-		s.statsMu.Lock()
-		s.stats.Left -= int64(len(piece))
-		s.statsMu.Unlock()
 
 		err = sendHave(client, uint32(index))
 		if err != nil {
 			return err
 		}
 
-		log.Printf("Piece %d completed, %d/%d, %d bytes written", index, s.completedCount, len(s.torrent.Pieces), len(piece))
+		log.Printf("Piece %d completed, %d/%d, %d bytes written", index, s.CompletedPieces(), len(s.torrent.Pieces), len(piece))
 	}
 
 	return nil
@@ -200,14 +196,41 @@ func (s *Session) DownloadFromPeers(
 }
 
 func (s *Session) Complete() bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	return s.completedCount == len(s.torrent.Pieces)
 }
 
 // Stats returns an independent snapshot without holding the lock after return.
 func (s *Session) Stats() Stats {
-	s.statsMu.Lock()
-	defer s.statsMu.Unlock()
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	return s.stats
+}
+
+func (s *Session) HasPiece(index int) bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+
+	if index < 0 || index >= len(s.torrent.Pieces) {
+		return false
+	}
+
+	return s.completed.HasPiece(index)
+}
+
+func (s *Session) Availability() peer.Bitfield {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+
+	return slices.Clone(s.completed)
+}
+
+func (s *Session) CompletedPieces() int {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+
+	return s.completedCount
 }
 
 func (s *Session) storePiece(index int, data []byte) error {
@@ -226,6 +249,28 @@ func (s *Session) storePiece(index int, data []byte) error {
 	if n != int(expectedSize) {
 		return fmt.Errorf("write error for piece %d: %w", index, io.ErrShortWrite)
 	}
+
+	return nil
+}
+
+func (s *Session) markComplete(index int) error {
+	pieceSize, err := PieceSize(s.torrent, index)
+	if err != nil {
+		return err
+	}
+
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+
+	if s.completed.HasPiece(index) {
+		return fmt.Errorf("piece %d already completed", index)
+	}
+	err = s.completed.SetPiece(index)
+	if err != nil {
+		return err
+	}
+	s.completedCount++
+	s.stats.Left -= pieceSize
 
 	return nil
 }

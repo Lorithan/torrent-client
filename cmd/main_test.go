@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/binary"
 	"errors"
@@ -99,7 +100,7 @@ func TestRunContinuesWithSecondPeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	prepareRun(t, "-torrent", torrentPath, "-output", outputPath, "-workers", "1")
-	if err := run(25 * time.Millisecond); err != nil {
+	if err := run(context.Background(), 25*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-firstDone; err != nil {
@@ -212,7 +213,7 @@ func TestRunWorkerFlagEnablesOverlappingPeerRequests(t *testing.T) {
 	prepareRun(t, "-torrent", torrentPath, "-output", outputPath, "-workers", "2")
 	done := make(chan struct{})
 	var runErr error
-	go func() { defer close(done); runErr = run(25 * time.Millisecond) }()
+	go func() { defer close(done); runErr = run(context.Background(), 25*time.Millisecond) }()
 	// Join the CLI before prepareRun restores global flags and logging.
 	t.Cleanup(func() {
 		unblock()
@@ -287,7 +288,8 @@ func prepareRun(t *testing.T, args ...string) *bytes.Buffer {
 		log.SetFlags(previousLogFlags)
 		log.SetPrefix(previousPrefix)
 	})
-	os.Args = append([]string{"torrent-client"}, args...)
+	// Existing CLI tests exercise download-and-exit; seeding tests override this.
+	os.Args = append([]string{"torrent-client", "-seed=false"}, args...)
 	flag.CommandLine = flag.NewFlagSet("torrent-client", flag.ContinueOnError)
 	var output bytes.Buffer
 	flag.CommandLine.SetOutput(&output)
@@ -454,7 +456,7 @@ func runDownloadScenario(t *testing.T, scenario string) {
 		t.Fatal(err)
 	}
 	output := prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
-	runErr := run(25 * time.Millisecond)
+	runErr := run(context.Background(), 25*time.Millisecond)
 	if scenario == "existing output" {
 		// Output refusal now happens before connecting. Release the unused fake peer.
 		peerListener.Close()
@@ -613,7 +615,7 @@ func TestRunTrackerFailures(t *testing.T) {
 				t.Fatal(err)
 			}
 			prepareRun(t, "-torrent", path, "-output", outputPath)
-			err := run(25 * time.Millisecond)
+			err := run(context.Background(), 25*time.Millisecond)
 			if err == nil {
 				t.Fatal("expected tracker error")
 			}
@@ -648,7 +650,7 @@ func TestRunExistingOutputDoesNotAnnounce(t *testing.T) {
 		t.Fatal(err)
 	}
 	prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
-	if err := run(25 * time.Millisecond); !os.IsExist(err) {
+	if err := run(context.Background(), 25*time.Millisecond); !os.IsExist(err) {
 		t.Errorf("error = %v, want file-exists error", err)
 	}
 	if len(requests) != 0 {
@@ -657,6 +659,177 @@ func TestRunExistingOutputDoesNotAnnounce(t *testing.T) {
 	got, err := os.ReadFile(outputPath)
 	if err != nil || !bytes.Equal(got, want) {
 		t.Errorf("existing output changed: %q, error %v", got, err)
+	}
+}
+
+func TestRunSeedsCompletedFileUntilCanceled(t *testing.T) {
+	firstHash, secondHash := sha1.Sum([]byte("abcd")), sha1.Sum([]byte("efgh"))
+	info := "d6:lengthi8e4:name8:file.bin12:piece lengthi4e6:pieces40:" + string(firstHash[:]) + string(secondHash[:]) + "e"
+	infoHash := sha1.Sum([]byte(info))
+	addr, peerDone := startFallbackTestPeerWithVerifier(t, peer.Handshake{InfoHash: infoHash}, func(conn net.Conn) error {
+		for index, data := range []string{"abcd", "efgh"} {
+			if err := fallbackTestRequest(conn, uint32(index)); err != nil {
+				return err
+			}
+			if err := fallbackTestReply(conn, uint32(index), []byte(data)); err != nil {
+				return err
+			}
+			if err := fallbackTestHave(conn, uint32(index)); err != nil {
+				return err
+			}
+		}
+		return fallbackTestExpectClosed(conn)
+	}, func(wire [68]byte) error {
+		if !bytes.Equal(wire[28:48], infoHash[:]) {
+			return errors.New("wrong download info hash")
+		}
+		return nil
+	})
+	compact := binary.BigEndian.AppendUint16([]byte{127, 0, 0, 1}, uint16(addr.Port))
+	announces := make(chan url.Values, 16)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		announces <- r.URL.Query()
+		_, _ = fmt.Fprintf(w, "d8:intervali1e5:peers%d:%se", len(compact), compact)
+	}))
+	t.Cleanup(server.Close)
+	dir := t.TempDir()
+	torrentPath, outputPath := filepath.Join(dir, "input.torrent"), filepath.Join(dir, "output.bin")
+	meta := fmt.Appendf(nil, "d8:announce%d:%s4:info%se", len(server.URL), server.URL, info)
+	if err := os.WriteFile(torrentPath, meta, 0600); err != nil {
+		t.Fatal(err)
+	}
+	prepareRun(t, "-torrent", torrentPath, "-output", outputPath, "-seed=true")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var runErr error
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("run did not shut down")
+		}
+	})
+	go func() { defer close(done); runErr = run(ctx, 25*time.Millisecond) }()
+	nextAnnounce := func() url.Values {
+		t.Helper()
+		select {
+		case q := <-announces:
+			return q
+		case <-done:
+			t.Fatalf("run exited before expected announce: %v", runErr)
+		case <-time.After(8 * time.Second):
+			t.Fatal("timed out waiting for announce")
+		}
+		return nil
+	}
+	started := nextAnnounce()
+	if started.Get("event") != "started" {
+		t.Fatal("missing started announce")
+	}
+	completed := nextAnnounce()
+	if completed.Get("event") != "completed" || completed.Get("left") != "0" {
+		t.Fatalf("completion announce=%v", completed)
+	}
+	select {
+	case <-done:
+		t.Fatalf("seeding exited after completion: %v", runErr)
+	default:
+	}
+	conn, err := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", started.Get("port")), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	remote := peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{'u'}}
+	if _, err := conn.Write(remote.Serialize()); err != nil {
+		t.Fatal(err)
+	}
+	reply, err := peer.ReadHandshake(conn)
+	if err != nil || reply == nil || reply.InfoHash != infoHash || string(reply.PeerID[:]) != started.Get("peer_id") {
+		t.Fatalf("incoming handshake=%+v, err=%v", reply, err)
+	}
+	availability, err := peer.ReadMessage(conn)
+	if err != nil || availability == nil || availability.ID != peer.MsgBitfield || !bytes.Equal(availability.Payload, []byte{0xc0}) {
+		t.Fatalf("availability=%v, err=%v", availability, err)
+	}
+	if _, err := conn.Write([]byte{0, 0, 0, 1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	unchoke, err := peer.ReadMessage(conn)
+	if err != nil || unchoke == nil || unchoke.ID != peer.MsgUnchoke {
+		t.Fatalf("unchoke=%v, err=%v", unchoke, err)
+	}
+	request, err := peer.NewRequest(1, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(request.Serialize()); err != nil {
+		t.Fatal(err)
+	}
+	block, err := peer.ReadMessage(conn)
+	if err != nil || block == nil || block.ID != peer.MsgPiece || !bytes.Equal(block.Payload, []byte{0, 0, 0, 1, 0, 0, 0, 1, 'f', 'g'}) {
+		t.Fatalf("uploaded block=%v, err=%v", block, err)
+	}
+	regular := nextAnnounce()
+	if regular.Get("event") != "" || regular.Get("left") != "0" || regular.Get("downloaded") != "8" || regular.Get("uploaded") != "2" {
+		t.Fatalf("seeding update=%v", regular)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("seeding did not stop")
+	}
+	if !errors.Is(runErr, context.Canceled) {
+		t.Errorf("run error=%v, want context.Canceled", runErr)
+	}
+	stopped := <-announces
+	if stopped.Get("event") != "stopped" || stopped.Get("uploaded") != "2" {
+		t.Errorf("stopped announce=%v", stopped)
+	}
+	expectIncomingTestEOF(t, conn)
+	if err := <-peerDone; err != nil {
+		t.Errorf("download peer: %v", err)
+	}
+	if data, err := os.ReadFile(outputPath); err != nil || string(data) != "abcdefgh" {
+		t.Errorf("output=%q, err=%v", data, err)
+	}
+}
+
+func TestRunParentCancellationStopsServices(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	events := make(chan string, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		event := r.URL.Query().Get("event")
+		events <- event
+		if event == "started" {
+			cancel()
+		}
+		_, _ = io.WriteString(w, "d8:intervali1800e5:peers0:e")
+	}))
+	t.Cleanup(server.Close)
+	dir := t.TempDir()
+	torrentPath := filepath.Join(dir, "input.torrent")
+	outputPath := filepath.Join(dir, "output.bin")
+	info := "d6:lengthi4e4:name8:file.bin12:piece lengthi4e6:pieces20:01234567890123456789e"
+	meta := fmt.Appendf(nil, "d8:announce%d:%s4:info%se", len(server.URL), server.URL, info)
+	if err := os.WriteFile(torrentPath, meta, 0600); err != nil {
+		t.Fatal(err)
+	}
+	prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
+	if err := run(ctx, time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run() error=%v, want context.Canceled", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("announce count=%d, want started and stopped", len(events))
+	}
+	if first, last := <-events, <-events; first != "started" || last != "stopped" {
+		t.Errorf("events=%q, %q; want started, stopped", first, last)
 	}
 }
 
@@ -684,7 +857,7 @@ func TestRunNoPeers(t *testing.T) {
 				t.Fatal(err)
 			}
 			logs := prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
-			err := run(25 * time.Millisecond)
+			err := run(context.Background(), 25*time.Millisecond)
 			if len(announces) != 2 {
 				t.Errorf("announce count = %d, want started and stopped", len(announces))
 			}
@@ -744,7 +917,7 @@ func TestRunRequiresArguments(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			prepareRun(t, tt.args...)
-			err := run(25 * time.Millisecond)
+			err := run(context.Background(), 25*time.Millisecond)
 			if err == nil || !strings.Contains(err.Error(), tt.message) {
 				t.Errorf("error = %v, want %q", err, tt.message)
 			}
@@ -767,7 +940,7 @@ func TestRunRejectsUnreadableOrInvalidTorrent(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			output := prepareRun(t, "-torrent", tt.path, "-output", filepath.Join(dir, "output.bin"))
-			if err := run(25 * time.Millisecond); err == nil {
+			if err := run(context.Background(), 25*time.Millisecond); err == nil {
 				t.Error("expected an error")
 			}
 			if strings.Contains(output.String(), "Torrent file read") {
@@ -791,7 +964,7 @@ func TestRunPortRange(t *testing.T) {
 	} {
 		t.Run(tt.port, func(t *testing.T) {
 			prepareRun(t, "-torrent", missingPath, "-output", "output.bin", "-port", tt.port)
-			err := run(25 * time.Millisecond)
+			err := run(context.Background(), 25*time.Millisecond)
 			if tt.valid {
 				// An accepted port reaches the next step: opening the torrent file.
 				if !os.IsNotExist(err) {
@@ -823,7 +996,7 @@ func TestRunWorkerLimit(t *testing.T) {
 				args = append(args, "-workers", tt.value)
 			}
 			prepareRun(t, args...)
-			err := run(25 * time.Millisecond)
+			err := run(context.Background(), 25*time.Millisecond)
 			if tt.valid {
 				if !os.IsNotExist(err) {
 					t.Errorf("valid worker limit did not reach file loading: %v", err)

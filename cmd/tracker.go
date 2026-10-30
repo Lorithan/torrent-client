@@ -53,3 +53,24 @@ func runTrackerUpdates(
 		timer.Reset(interval)
 	}
 }
+
+func startTrackerUpdates(
+	ctx context.Context,
+	refresh <-chan struct{},
+	interval time.Duration,
+	minDelay time.Duration,
+	announce func() (*tracker.TrackerResponse, error),
+) func() {
+	childCtx, cancelChild := context.WithCancel(ctx)
+	completion := make(chan struct{})
+
+	go func() {
+		runTrackerUpdates(childCtx, refresh, interval, minDelay, announce)
+		close(completion)
+	}()
+
+	return func() {
+		cancelChild()
+		<-completion
+	}
+}

@@ -56,6 +56,23 @@ func NewHave(index uint32) Message {
 	}
 }
 
+func NewPiece(index uint32, begin uint32, data []byte) (*Message, error) {
+	if len(data) > maxBlockLength || len(data) < 1 {
+		return nil, fmt.Errorf("length out of bounds")
+	}
+
+	payload := make([]byte, 0, 8+len(data))
+
+	payload = binary.BigEndian.AppendUint32(payload, index)
+	payload = binary.BigEndian.AppendUint32(payload, begin)
+	payload = append(payload, data...)
+
+	return &Message{
+		ID:      MsgPiece,
+		Payload: payload,
+	}, nil
+}
+
 func (m Message) Serialize() []byte {
 	serialize := make([]byte, 4, len(m.Payload)+5)
 
@@ -88,6 +105,30 @@ func (m Message) PieceBlock() (*PieceBlock, error) {
 		Index: index,
 		Begin: begin,
 		Data:  data,
+	}, nil
+}
+
+func (m Message) BlockRequest() (*BlockRequest, error) {
+	if m.ID != MsgRequest {
+		return nil, fmt.Errorf("expected message request")
+	}
+
+	if len(m.Payload) != 12 {
+		return nil, fmt.Errorf("message payload should be 12 bytes")
+	}
+
+	index := binary.BigEndian.Uint32(m.Payload[0:4])
+	begin := binary.BigEndian.Uint32(m.Payload[4:8])
+	length := binary.BigEndian.Uint32(m.Payload[8:12])
+
+	if length < 1 || length > maxBlockLength {
+		return nil, fmt.Errorf("length out of bounds")
+	}
+
+	return &BlockRequest{
+		Index:  index,
+		Begin:  begin,
+		Length: length,
 	}, nil
 }
 

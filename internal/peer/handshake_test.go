@@ -110,6 +110,113 @@ func TestExchangeHandshakeErrors(t *testing.T) {
 	}
 }
 
+type handshakeTestWriterFunc func([]byte) (int, error)
+
+func (f handshakeTestWriterFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestAcceptHandshake(t *testing.T) {
+	remote, remoteWire := handshakeReadFixture()
+	local := remote
+	local.PeerID = [20]byte{'l', 'o', 'c', 'a', 'l'}
+	local.ReservedFlags = [8]byte{}
+	wantWire := bytes.Clone(remoteWire)
+	clear(wantWire[20:28])
+	copy(wantWire[48:], local.PeerID[:])
+	source := bytes.NewReader(append(bytes.Clone(remoteWire), 42))
+	var outgoing bytes.Buffer
+	conn := &exchangeTestConn{reader: iotest.OneByteReader(source)}
+	conn.writer = handshakeTestWriterFunc(func(p []byte) (int, error) {
+		if source.Len() != 1 {
+			t.Errorf("reply sent before reading complete remote handshake: %d bytes remain", source.Len())
+		}
+		return outgoing.Write(p)
+	})
+	got, err := AcceptHandshake(conn, local)
+	if err != nil || got == nil || *got != remote {
+		t.Fatalf("AcceptHandshake()=(%+v, %v), want %+v", got, err, remote)
+	}
+	if !bytes.Equal(outgoing.Bytes(), wantWire) {
+		t.Errorf("reply=%x, want %x", outgoing.Bytes(), wantWire)
+	}
+	if conn.closed {
+		t.Error("closed caller-owned connection")
+	}
+	var next [1]byte
+	if _, err := io.ReadFull(conn, next[:]); err != nil || next[0] != 42 {
+		t.Errorf("following byte=%d, err=%v", next[0], err)
+	}
+}
+
+func TestAcceptHandshakeRejectsBeforeReply(t *testing.T) {
+	local, wire := handshakeReadFixture()
+	mismatch := bytes.Clone(wire)
+	mismatch[28] ^= 0xff
+	badProtocol := bytes.Clone(wire)
+	badProtocol[1] ^= 0xff
+	readErr := errors.New("incoming handshake read failed")
+	for _, tc := range []struct {
+		name    string
+		reader  io.Reader
+		wantErr error
+	}{
+		{"wrong torrent", bytes.NewReader(mismatch), nil},
+		{"wrong protocol", bytes.NewReader(badProtocol), nil},
+		{"wrong protocol length", bytes.NewReader([]byte{18}), nil},
+		{"truncated", bytes.NewReader(wire[:40]), io.ErrUnexpectedEOF},
+		{"empty", bytes.NewReader(nil), io.EOF},
+		{"read failure", iotest.ErrReader(readErr), readErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var outgoing bytes.Buffer
+			conn := &exchangeTestConn{reader: tc.reader, writer: &outgoing}
+			got, err := AcceptHandshake(conn, local)
+			if err == nil || got != nil {
+				t.Fatalf("AcceptHandshake()=(%+v, %v), want nil handshake and error", got, err)
+			}
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Errorf("error=%v, want %v", err, tc.wantErr)
+			}
+			if outgoing.Len() != 0 {
+				t.Error("replied to rejected handshake")
+			}
+			if conn.closed {
+				t.Error("closed caller-owned connection")
+			}
+		})
+	}
+}
+
+func TestAcceptHandshakeWriteFailures(t *testing.T) {
+	local, wire := handshakeReadFixture()
+	writeErr := errors.New("handshake reply write failed")
+	for _, tc := range []struct {
+		name         string
+		n            int
+		err, wantErr error
+	}{
+		{"write error", 0, writeErr, writeErr},
+		{"partial with error", 5, writeErr, writeErr},
+		{"short write", 5, nil, io.ErrShortWrite},
+		{"zero write", 0, nil, io.ErrShortWrite},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			conn := &exchangeTestConn{reader: bytes.NewReader(wire)}
+			conn.writer = handshakeTestWriterFunc(func(p []byte) (int, error) { calls++; return tc.n, tc.err })
+			got, err := AcceptHandshake(conn, local)
+			if got != nil || !errors.Is(err, tc.wantErr) {
+				t.Errorf("AcceptHandshake()=(%+v, %v), want nil and %v", got, err, tc.wantErr)
+			}
+			if calls != 1 {
+				t.Errorf("write calls=%d, want 1", calls)
+			}
+			if conn.closed {
+				t.Error("closed caller-owned connection")
+			}
+		})
+	}
+}
+
 func TestReadHandshake(t *testing.T) {
 	want, wire := handshakeReadFixture()
 	for _, tt := range []struct {

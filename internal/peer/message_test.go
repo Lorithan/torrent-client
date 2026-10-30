@@ -316,3 +316,121 @@ func TestNewRequestRejectsInvalidLength(t *testing.T) {
 		}
 	}
 }
+
+func TestMessageBlockRequest(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		payload []byte
+		want    BlockRequest
+	}{
+		{"zero index and offset, minimum length", []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, BlockRequest{Index: 0, Begin: 0, Length: 1}},
+		{"big endian fields", []byte{1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 4, 5}, BlockRequest{Index: 0x01020304, Begin: 0x05060708, Length: 0x0405}},
+		{"full uint32 values and maximum block", []byte{255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0x40, 0}, BlockRequest{Index: ^uint32(0), Begin: ^uint32(0), Length: 16384}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			before := bytes.Clone(tt.payload)
+			got, err := (Message{ID: MsgRequest, Payload: tt.payload}).BlockRequest()
+			if err != nil || got == nil {
+				t.Fatalf("BlockRequest = %v, %v", got, err)
+			}
+			if *got != tt.want {
+				t.Errorf("request = %+v, want %+v", *got, tt.want)
+			}
+			if !bytes.Equal(tt.payload, before) {
+				t.Error("parsing changed the message payload")
+			}
+		})
+	}
+}
+
+func TestMessageBlockRequestRejectsInvalidInput(t *testing.T) {
+	t.Run("wrong message IDs", func(t *testing.T) {
+		payload := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+		for _, id := range []MessageID{MsgChoke, MsgUnchoke, MsgInterested, MsgNotInterested, MsgHave, MsgBitfield, MsgPiece, MsgCancel, MessageID(255)} {
+			if got, err := (Message{ID: id, Payload: payload}).BlockRequest(); got != nil || err == nil {
+				t.Errorf("message ID %d = %v, %v; want nil request and error", id, got, err)
+			}
+		}
+	})
+	t.Run("payload sizes", func(t *testing.T) {
+		for _, size := range []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 24} {
+			payload := make([]byte, size)
+			if size >= 12 {
+				binary.BigEndian.PutUint32(payload[8:12], 1)
+			}
+			if got, err := (Message{ID: MsgRequest, Payload: payload}).BlockRequest(); got != nil || err == nil {
+				t.Errorf("payload size %d = %v, %v; want nil request and error", size, got, err)
+			}
+		}
+	})
+	t.Run("block lengths", func(t *testing.T) {
+		for _, length := range []uint32{0, 16385, ^uint32(0)} {
+			payload := make([]byte, 12)
+			binary.BigEndian.PutUint32(payload[8:12], length)
+			if got, err := (Message{ID: MsgRequest, Payload: payload}).BlockRequest(); got != nil || err == nil {
+				t.Errorf("block length %d = %v, %v; want nil request and error", length, got, err)
+			}
+		}
+	})
+}
+
+func TestNewPiece(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		index  uint32
+		begin  uint32
+		data   []byte
+		prefix []byte
+	}{
+		{"minimum block", 0, 0, []byte{0xab}, []byte{0, 0, 0, 0, 0, 0, 0, 0}},
+		{"big endian fields and binary data", 0x01020304, 0x05060708, []byte{0, 255, 128, 1}, []byte{1, 2, 3, 4, 5, 6, 7, 8}},
+		{"maximum block and uint32 fields", ^uint32(0), ^uint32(0), bytes.Repeat([]byte{0xab}, 16384), bytes.Repeat([]byte{255}, 8)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			m, err := NewPiece(tt.index, tt.begin, tt.data)
+			if err != nil || m == nil {
+				t.Fatalf("NewPiece = %v, %v", m, err)
+			}
+			want := append(bytes.Clone(tt.prefix), tt.data...)
+			if m.ID != MsgPiece || !bytes.Equal(m.Payload, want) {
+				t.Fatalf("unexpected piece message: ID %d, payload length %d", m.ID, len(m.Payload))
+			}
+			wire := m.Serialize()
+			if binary.BigEndian.Uint32(wire[:4]) != uint32(9+len(tt.data)) || wire[4] != byte(MsgPiece) || !bytes.Equal(wire[5:], want) {
+				t.Error("serialized piece has incorrect message length, ID, or payload")
+			}
+			block, err := m.PieceBlock()
+			if err != nil || block == nil {
+				t.Fatalf("piece response could not be parsed: %v", err)
+			}
+			if block.Index != tt.index || block.Begin != tt.begin || !bytes.Equal(block.Data, tt.data) {
+				t.Error("piece parser did not recover the transmitted block")
+			}
+		})
+	}
+}
+
+func TestNewPieceOwnsPayloadData(t *testing.T) {
+	data := make([]byte, 3, 32)
+	copy(data, []byte{1, 2, 3})
+	m, err := NewPiece(7, 16, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[0] = 99
+	if !bytes.Equal(m.Payload[8:], []byte{1, 2, 3}) {
+		t.Fatal("caller mutation changed the outgoing piece payload")
+	}
+	m.Payload[9] = 88
+	if data[1] != 2 {
+		t.Error("message mutation changed the caller's data")
+	}
+}
+
+func TestNewPieceRejectsInvalidLength(t *testing.T) {
+	for _, data := range [][]byte{nil, {}, make([]byte, 16385)} {
+		if m, err := NewPiece(0, 0, data); m != nil || err == nil {
+			t.Errorf("data length %d = %v, %v; want nil message and error", len(data), m, err)
+		}
+	}
+}
