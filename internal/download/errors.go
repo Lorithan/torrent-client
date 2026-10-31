@@ -1,6 +1,9 @@
 package download
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 type PeerError struct {
 	Op  string
@@ -13,4 +16,12 @@ func (e *PeerError) Error() string {
 
 func (e *PeerError) Unwrap() error {
 	return e.Err
+}
+
+func cancelledOrErr(ctx context.Context, err error) error {
+	cancelled := ctx.Err()
+	if cancelled != nil {
+		return cancelled
+	}
+	return err
 }

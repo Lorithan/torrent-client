@@ -662,6 +662,173 @@ func TestRunExistingOutputDoesNotAnnounce(t *testing.T) {
 	}
 }
 
+func TestRunUploadsVerifiedStorageWhileDownloading(t *testing.T) {
+	firstHash, secondHash := sha1.Sum([]byte("abcd")), sha1.Sum([]byte("efgh"))
+	info := "d6:lengthi8e4:name8:file.bin12:piece lengthi4e6:pieces40:" + string(firstHash[:]) + string(secondHash[:]) + "e"
+	infoHash := sha1.Sum([]byte(info))
+	secondRequested, releaseSecond := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseSecond) }) }
+	t.Cleanup(release)
+	addr, peerDone := startFallbackTestPeerWithVerifier(t, peer.Handshake{InfoHash: infoHash}, func(conn net.Conn) error {
+		if err := fallbackTestRequest(conn, 0); err != nil {
+			return err
+		}
+		if err := fallbackTestReply(conn, 0, []byte("abcd")); err != nil {
+			return err
+		}
+		if err := fallbackTestHave(conn, 0); err != nil {
+			return err
+		}
+		if err := fallbackTestRequest(conn, 1); err != nil {
+			return err
+		}
+		close(secondRequested)
+		<-releaseSecond
+		if err := fallbackTestReply(conn, 1, []byte("efgh")); err != nil {
+			return err
+		}
+		if err := fallbackTestHave(conn, 1); err != nil {
+			return err
+		}
+		return fallbackTestExpectClosed(conn)
+	}, func(wire [68]byte) error {
+		if !bytes.Equal(wire[28:48], infoHash[:]) {
+			return errors.New("wrong download info hash")
+		}
+		return nil
+	}, 10*time.Second)
+	compact := binary.BigEndian.AppendUint16([]byte{127, 0, 0, 1}, uint16(addr.Port))
+	announces := make(chan url.Values, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		announces <- r.URL.Query()
+		_, _ = fmt.Fprintf(w, "d8:intervali1800e5:peers%d:%se", len(compact), compact)
+	}))
+	t.Cleanup(server.Close)
+	dir := t.TempDir()
+	torrentPath, outputPath := filepath.Join(dir, "input.torrent"), filepath.Join(dir, "output.bin")
+	meta := fmt.Appendf(nil, "d8:announce%d:%s4:info%se", len(server.URL), server.URL, info)
+	if err := os.WriteFile(torrentPath, meta, 0600); err != nil {
+		t.Fatal(err)
+	}
+	prepareRun(t, "-torrent", torrentPath, "-output", outputPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var runErr error
+	t.Cleanup(func() {
+		release()
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("run did not shut down")
+		}
+	})
+	go func() { defer close(done); runErr = run(ctx, 25*time.Millisecond) }()
+	var started url.Values
+	select {
+	case started = <-announces:
+	case <-time.After(3 * time.Second):
+		t.Fatal("missing started announce")
+	}
+	select {
+	case <-secondRequested:
+	case <-time.After(3 * time.Second):
+		t.Fatal("download did not reach gated second piece")
+	}
+	requester := func() net.Conn {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", started.Get("port")), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write((peer.Handshake{InfoHash: infoHash}).Serialize()); err != nil {
+			t.Fatal(err)
+		}
+		reply, err := peer.ReadHandshake(conn)
+		if err != nil || reply == nil || string(reply.PeerID[:]) != started.Get("peer_id") {
+			t.Fatalf("incoming handshake=%+v, err=%v", reply, err)
+		}
+		msg, err := peer.ReadMessage(conn)
+		if err != nil || msg == nil || msg.ID != peer.MsgBitfield || !bytes.Equal(msg.Payload, []byte{0x80}) {
+			t.Fatalf("partial availability=%v, err=%v", msg, err)
+		}
+		if _, err := conn.Write([]byte{0, 0, 0, 1, 2}); err != nil {
+			t.Fatal(err)
+		}
+		msg, err = peer.ReadMessage(conn)
+		if err != nil || msg == nil || msg.ID != peer.MsgUnchoke {
+			t.Fatalf("unchoke=%v, err=%v", msg, err)
+		}
+		return conn
+	}
+	conn := requester()
+	request, err := peer.NewRequest(0, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(request.Serialize()); err != nil {
+		t.Fatal(err)
+	}
+	block, err := peer.ReadMessage(conn)
+	if err != nil || block == nil || block.ID != peer.MsgPiece || !bytes.Equal(block.Payload, []byte{0, 0, 0, 0, 0, 0, 0, 1, 'b', 'c'}) {
+		t.Fatalf("uploaded verified data=%v, err=%v", block, err)
+	}
+	// The second piece is still being downloaded and must not be exposed.
+	request, err = peer.NewRequest(1, 0, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(request.Serialize()); err != nil {
+		t.Fatal(err)
+	}
+	expectIncomingTestEOF(t, conn)
+	for _, wire := range [][]byte{
+		{0, 0, 0, 2, 6, 42}, // Malformed request payload.
+		{0, 0, 0, 13, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2}, // Crosses piece boundary.
+	} {
+		bad := requester()
+		if _, err := bad.Write(wire); err != nil {
+			t.Fatal(err)
+		}
+		expectIncomingTestEOF(t, bad)
+	}
+	select {
+	case <-done:
+		t.Fatalf("peer rejection stopped active download: %v", runErr)
+	default:
+	}
+	release()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("download did not finish")
+	}
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if err := <-peerDone; err != nil {
+		t.Errorf("download peer: %v", err)
+	}
+	for _, event := range []string{"completed", "stopped"} {
+		select {
+		case q := <-announces:
+			if q.Get("event") != event || q.Get("uploaded") != "2" || q.Get("downloaded") != "8" || q.Get("left") != "0" {
+				t.Errorf("%s announce=%v", event, q)
+			}
+		default:
+			t.Errorf("missing %s announce", event)
+		}
+	}
+	if data, err := os.ReadFile(outputPath); err != nil || string(data) != "abcdefgh" {
+		t.Errorf("output=%q, err=%v", data, err)
+	}
+}
+
 func TestRunSeedsCompletedFileUntilCanceled(t *testing.T) {
 	firstHash, secondHash := sha1.Sum([]byte("abcd")), sha1.Sum([]byte("efgh"))
 	info := "d6:lengthi8e4:name8:file.bin12:piece lengthi4e6:pieces40:" + string(firstHash[:]) + string(secondHash[:]) + "e"

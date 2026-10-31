@@ -3,10 +3,16 @@ package download
 import (
 	"context"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/lorithan/torrent-client/internal/peer"
 )
+
+type uploadReadResult struct {
+	message *peer.Message
+	err     error
+}
 
 func (s *Session) UploadBlock(client *peer.Client, request peer.BlockRequest) error {
 	if client.AmChoking {
@@ -36,6 +42,45 @@ func (s *Session) UploadBlock(client *peer.Client, request peer.BlockRequest) er
 	s.stateMu.Unlock()
 
 	return nil
+}
+
+func readUploadMessages(
+	ctx context.Context,
+	conn net.Conn,
+	results chan<- uploadReadResult,
+) {
+	for {
+		if cancelled := ctx.Err(); cancelled != nil {
+			return
+		}
+
+		err := conn.SetReadDeadline(time.Now().Add(3 * time.Minute))
+		if err != nil {
+			uploadResult := uploadReadResult{
+				err: err,
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case results <- uploadResult:
+			}
+			return
+		}
+
+		msg, err := peer.ReadMessage(conn)
+		uploadResult := uploadReadResult{
+			message: msg,
+			err:     err,
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case results <- uploadResult:
+			if err != nil {
+				return
+			}
+		}
+	}
 }
 
 func (s *Session) handleUploadMessage(client *peer.Client, msg *peer.Message) error {
@@ -82,21 +127,29 @@ func (s *Session) ServePeer(ctx context.Context, client *peer.Client) error {
 
 	err := client.Conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	if err != nil {
-		cancelled := ctx.Err()
-		if cancelled != nil {
-			return cancelled
-		}
-		return err
+		return cancelledOrErr(ctx, err)
 	}
-	availability := s.Availability()
+	availability, availabilityChan := s.availabilitySnapshot()
 	err = client.SendBitfield(availability)
 	if err != nil {
-		cancelled := ctx.Err()
-		if cancelled != nil {
-			return cancelled
-		}
-		return err
+		return cancelledOrErr(ctx, err)
 	}
+
+	readerCtx, readerCancel := context.WithCancel(ctx)
+	results := make(chan uploadReadResult)
+	readerDone := make(chan struct{})
+
+	go func() {
+		defer close(readerDone)
+		readUploadMessages(readerCtx, client.Conn, results)
+	}()
+
+	cleanup := func() {
+		readerCancel()
+		client.Conn.Close()
+		<-readerDone
+	}
+	defer cleanup()
 
 	for {
 		cancelled := ctx.Err()
@@ -104,38 +157,61 @@ func (s *Session) ServePeer(ctx context.Context, client *peer.Client) error {
 			return cancelled
 		}
 
-		err := client.Conn.SetReadDeadline(time.Now().Add(3 * time.Minute))
-		if err != nil {
-			cancelled := ctx.Err()
-			if cancelled != nil {
-				return cancelled
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case result := <-results:
+			if result.err != nil {
+				return cancelledOrErr(ctx, result.err)
 			}
-			return err
-		}
-		msg, err := peer.ReadMessage(client.Conn)
-		if err != nil {
-			cancelled := ctx.Err()
-			if cancelled != nil {
-				return cancelled
-			}
-			return err
-		}
 
-		err = client.Conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-		if err != nil {
+			err = client.Conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			if err != nil {
+				return cancelledOrErr(ctx, err)
+			}
+
+			err = s.handleUploadMessage(client, result.message)
+			if err != nil {
+				return cancelledOrErr(ctx, err)
+			}
+		case <-availabilityChan:
 			cancelled := ctx.Err()
 			if cancelled != nil {
 				return cancelled
 			}
-			return err
-		}
-		err = s.handleUploadMessage(client, msg)
-		if err != nil {
-			cancelled := ctx.Err()
-			if cancelled != nil {
-				return cancelled
+			newAvailability, newChannel := s.availabilitySnapshot()
+
+			err := s.sendAvailabilityUpdates(client, availability, newAvailability)
+			if err != nil {
+				return cancelledOrErr(ctx, err)
 			}
-			return err
+
+			availability = newAvailability
+			availabilityChan = newChannel
 		}
 	}
+}
+
+func (s *Session) sendAvailabilityUpdates(
+	client *peer.Client,
+	advertised peer.Bitfield,
+	available peer.Bitfield,
+) error {
+	err := client.Conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	if err != nil {
+		return err
+	}
+
+	for index := range len(s.torrent.Pieces) {
+		if available.HasPiece(index) && !advertised.HasPiece(index) {
+			msg := peer.NewHave(uint32(index))
+
+			err = client.SendMessage(msg)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,90 @@ type uploadTestConn struct {
 	wire    bytes.Buffer
 	err     error
 	partial bool
+}
+
+type uploadReaderTestConn struct {
+	net.Conn
+	reader      io.Reader
+	deadlineErr error
+}
+
+func (c *uploadReaderTestConn) Read(p []byte) (int, error)      { return c.reader.Read(p) }
+func (c *uploadReaderTestConn) SetReadDeadline(time.Time) error { return c.deadlineErr }
+
+func startUploadReaderTest(t *testing.T, ctx context.Context, cancel context.CancelFunc, conn net.Conn, results chan uploadReadResult) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { defer close(done); readUploadMessages(ctx, conn, results) }()
+	t.Cleanup(func() {
+		cancel()
+		// Drain broken implementations too, so a failing test does not leak a reader.
+		timer := time.NewTimer(time.Second)
+		defer timer.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-results:
+			case <-timer.C:
+				t.Error("reader did not terminate during test cleanup")
+				return
+			}
+		}
+	})
+	return done
+}
+
+func TestReadUploadMessagesCanceledWithoutReceiver(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	results := make(chan uploadReadResult)
+	conn := &uploadReaderTestConn{reader: bytes.NewReader(nil)}
+	done := startUploadReaderTest(t, ctx, cancel, conn, results)
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("already-canceled reader blocked trying to publish a cancellation error")
+	}
+}
+
+func TestReadUploadMessagesDeliversMessagesThenStopsOnEOF(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	results := make(chan uploadReadResult, 3)
+	conn := &uploadReaderTestConn{reader: bytes.NewReader([]byte{0, 0, 0, 0, 0, 0, 0, 1, 2})}
+	done := startUploadReaderTest(t, ctx, cancel, conn, results)
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("reader continued reading after publishing EOF")
+	}
+	if len(results) != 3 {
+		t.Fatalf("result count=%d, want keep-alive, interested, EOF", len(results))
+	}
+	keepAlive, interested, failure := <-results, <-results, <-results
+	if keepAlive.message != nil || keepAlive.err != nil {
+		t.Errorf("keep-alive=%+v", keepAlive)
+	}
+	if interested.err != nil || interested.message == nil || interested.message.ID != peer.MsgInterested {
+		t.Errorf("interested=%+v", interested)
+	}
+	if failure.message != nil || !errors.Is(failure.err, io.EOF) {
+		t.Errorf("final result=%+v, want EOF", failure)
+	}
+}
+
+func TestReadUploadMessagesDeadlineFailureDeliveryCanBeCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	results := make(chan uploadReadResult)
+	sentinel := errors.New("read deadline failed")
+	conn := &uploadReaderTestConn{reader: bytes.NewReader(nil), deadlineErr: sentinel}
+	done := startUploadReaderTest(t, ctx, cancel, conn, results)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("deadline error delivery ignored cancellation")
+	}
 }
 
 func (c *uploadTestConn) Write(p []byte) (int, error) {
@@ -226,22 +311,34 @@ func TestSessionHandleUploadMessageKeepAlive(t *testing.T) {
 
 type serveTestConn struct {
 	*uploadTestConn
+	mu        sync.Mutex
 	reader    *bytes.Reader
 	deadlines []string
 	closes    int
 }
 
 func (c *serveTestConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
-func (c *serveTestConn) Close() error               { c.closes++; return nil }
+func (c *serveTestConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closes++
+	return nil
+}
 func (c *serveTestConn) SetDeadline(time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.deadlines = append(c.deadlines, "both")
 	return nil
 }
 func (c *serveTestConn) SetReadDeadline(time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.deadlines = append(c.deadlines, "read")
 	return nil
 }
 func (c *serveTestConn) SetWriteDeadline(time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.deadlines = append(c.deadlines, "write")
 	return nil
 }
@@ -269,15 +366,18 @@ func TestSessionServePeerConversation(t *testing.T) {
 	if !bytes.Equal(conn.wire.Bytes(), want) {
 		t.Errorf("wire=%x, want %x", conn.wire.Bytes(), want)
 	}
-	if conn.closes != 1 {
-		t.Errorf("Close calls=%d, want 1", conn.closes)
+	if conn.closes < 1 {
+		t.Error("connection was not closed")
 	}
 	if got := s.Stats().Uploaded; got != 2 {
 		t.Errorf("Uploaded=%d, want 2", got)
 	}
-	wantDeadlines := []string{"write", "read", "write", "read", "write", "read"}
-	if fmt.Sprint(conn.deadlines) != fmt.Sprint(wantDeadlines) {
-		t.Errorf("deadline sequence=%v, want %v", conn.deadlines, wantDeadlines)
+	counts := make(map[string]int)
+	for _, direction := range conn.deadlines {
+		counts[direction]++
+	}
+	if len(conn.deadlines) == 0 || conn.deadlines[0] != "write" || counts["write"] != 3 || counts["read"] != 3 || counts["both"] != 0 {
+		t.Errorf("deadlines=%v, want initial write deadline, three read and three write deadlines", conn.deadlines)
 	}
 }
 
@@ -304,7 +404,7 @@ func (c *serveGateConn) Write(p []byte) (int, error) {
 }
 
 func TestSessionServePeerCancellationUnblocksIO(t *testing.T) {
-	for _, phase := range []string{"initial write", "idle read"} {
+	for _, phase := range []string{"initial write", "idle read", "have write"} {
 		t.Run(phase, func(t *testing.T) {
 			dst := &blockTestStorage{data: []byte("abcd")}
 			s := blockTestSession(t, dst, 4)
@@ -318,10 +418,16 @@ func TestSessionServePeerCancellationUnblocksIO(t *testing.T) {
 			c := &peer.Client{Conn: gate, PieceCount: 1, Bitfield: peer.Bitfield{0}, AmChoking: true}
 			done := make(chan error, 1)
 			go func() { done <- s.ServePeer(ctx, c) }()
-			if phase == "idle read" {
+			if phase != "initial write" {
 				msg, err := peer.ReadMessage(remote)
 				if err != nil || msg == nil || msg.ID != peer.MsgBitfield {
 					t.Fatalf("initial message=%v, err=%v", msg, err)
+				}
+			}
+			if phase == "have write" {
+				<-gate.writing // Consume the initial bitfield write notification.
+				if err := s.markComplete(0); err != nil {
+					t.Fatal(err)
 				}
 			}
 			entered := gate.writing
@@ -344,4 +450,86 @@ func TestSessionServePeerCancellationUnblocksIO(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSessionServePeerBroadcastsAvailabilityAndServesNewPieces(t *testing.T) {
+	dst := &blockTestStorage{data: []byte("abcdefghijklmnop")}
+	s := blockTestSession(t, dst, 4)
+	if err := s.markComplete(0); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	remotes := make([]net.Conn, 0, 2)
+	for range 2 {
+		local, remote := net.Pipe()
+		gate := &serveGateConn{Conn: local, reading: make(chan struct{}, 1), writing: make(chan struct{}, 1)}
+		if err := remote.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { cancel(); local.Close(); remote.Close() })
+		c := &peer.Client{Conn: gate, PieceCount: 4, Bitfield: peer.Bitfield{0}, AmChoking: true}
+		done := make(chan error, 1)
+		go func() { done <- s.ServePeer(ctx, c) }()
+		t.Cleanup(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Error("peer handler did not terminate")
+			}
+		})
+		select {
+		case <-gate.writing:
+		case <-time.After(time.Second):
+			t.Fatal("initial bitfield write did not start")
+		}
+		remotes = append(remotes, remote)
+	}
+	// Both initial snapshots already exist, but their writes are blocked. These
+	// completions must be coalesced without losing either piece or blocking download.
+	if err := s.markComplete(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.markComplete(2); err != nil {
+		t.Fatal(err)
+	}
+	expect := func(conn net.Conn, id peer.MessageID, payload []byte) {
+		t.Helper()
+		msg, err := peer.ReadMessage(conn)
+		if err != nil || msg == nil || msg.ID != id || !bytes.Equal(msg.Payload, payload) {
+			t.Fatalf("message=%v, err=%v; want ID=%d payload=%x", msg, err, id, payload)
+		}
+	}
+	for _, remote := range remotes {
+		expect(remote, peer.MsgBitfield, []byte{0x80})
+		expect(remote, peer.MsgHave, []byte{0, 0, 0, 1})
+		expect(remote, peer.MsgHave, []byte{0, 0, 0, 2})
+	}
+	// A subsequent completion checks that both peers switched notification channels.
+	if err := s.markComplete(3); err != nil {
+		t.Fatal(err)
+	}
+	for _, remote := range remotes {
+		expect(remote, peer.MsgHave, []byte{0, 0, 0, 3})
+		if _, err := remote.Write([]byte{0, 0, 0, 1, 2}); err != nil {
+			t.Fatal(err)
+		}
+		// Any repeated have would appear here instead of the expected unchoke.
+		expect(remote, peer.MsgUnchoke, nil)
+		if _, err := remote.Write([]byte{0, 0, 0, 13, 6, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 4}); err != nil {
+			t.Fatal(err)
+		}
+		expect(remote, peer.MsgPiece, []byte{0, 0, 0, 3, 0, 0, 0, 0, 'm', 'n', 'o', 'p'})
+		// A subsequent response confirms the previous upload handler, including its
+		// counter update after Write returns, has finished.
+		if _, err := remote.Write([]byte{0, 0, 0, 1, 3}); err != nil {
+			t.Fatal(err)
+		}
+		expect(remote, peer.MsgChoke, nil)
+	}
+	if got := s.Stats().Uploaded; got != 8 {
+		t.Errorf("Uploaded=%d, want 8", got)
+	}
+	// Cleanup cancels and joins both readers/handlers before test state is released.
 }

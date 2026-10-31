@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"slices"
 	"sync"
 	"time"
@@ -22,12 +23,13 @@ type Stats struct {
 // Session retains progress across peer attempts and worker groups. Stats may be
 // called during a transfer; completion tracking and output have a single owner.
 type Session struct {
-	torrent        *torrent.TorrentFile
-	dest           Storage
-	completed      peer.Bitfield
-	completedCount int
-	stats          Stats
-	stateMu        sync.Mutex // Protects completion state and stats
+	torrent             *torrent.TorrentFile
+	dest                Storage
+	completed           peer.Bitfield
+	completedCount      int
+	stats               Stats
+	availabilityChanged chan struct{}
+	stateMu             sync.Mutex // Protects completion state and stats
 }
 
 func NewSession(tf *torrent.TorrentFile, dst Storage) (*Session, error) {
@@ -36,6 +38,9 @@ func NewSession(tf *torrent.TorrentFile, dst Storage) (*Session, error) {
 	}
 	if tf.Length < 0 {
 		return nil, fmt.Errorf("file length cannot be negative")
+	}
+	if uint64(len(tf.Pieces)) > uint64(math.MaxUint32)+1 {
+		return nil, fmt.Errorf("torrent data includes too many pieces")
 	}
 
 	expectedPieceCount := tf.Length / tf.PieceLength
@@ -55,11 +60,12 @@ func NewSession(tf *torrent.TorrentFile, dst Storage) (*Session, error) {
 	}
 
 	return &Session{
-		torrent:        tf,
-		dest:           dst,
-		completed:      completed,
-		completedCount: completedCount,
-		stats:          stats,
+		torrent:             tf,
+		dest:                dst,
+		completed:           completed,
+		completedCount:      completedCount,
+		availabilityChanged: make(chan struct{}),
+		stats:               stats,
 	}, nil
 }
 
@@ -272,5 +278,16 @@ func (s *Session) markComplete(index int) error {
 	s.completedCount++
 	s.stats.Left -= pieceSize
 
+	close(s.availabilityChanged)
+	s.availabilityChanged = make(chan struct{})
+
 	return nil
+}
+
+func (s *Session) availabilitySnapshot() (peer.Bitfield, <-chan struct{}) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+
+	availability := slices.Clone(s.completed)
+	return availability, s.availabilityChanged
 }

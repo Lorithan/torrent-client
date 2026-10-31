@@ -70,14 +70,24 @@ Manual testing has shown sustained downloads from a real swarm; that does not
 establish successful completion of the large real-world torrent tested or manual
 verification of parallel downloading against a public swarm.
 
-The current listener reserves an incoming port but does not accept and serve
-incoming peers. Uploading, seeding, and a TUI remain unfinished. A batch prepares
-connections sequentially; new tracker peers join subsequent batches rather than
-being added to an active group. Canceling a peer group closes its connections and
-joins its workers before returning. Discovery waits and tracker-worker cooldowns
-also support cancellation. CLI signal/quit integration and immediate cancellation
-of in-flight tracker HTTP calls and peer preparation remain lifecycle work; those
-operations currently have bounded timeouts.
+The listener accepts incoming TCP peers, validates their handshakes, advertises
+verified availability, and serves requested blocks from the output file. A limit
+of eight incoming connections includes handshakes; interested peers are unchoked
+under that limit. Completion notifications wake all incoming handlers, which send
+new have messages without blocking piece completion or sharing connection writes.
+The CLI seeds after completion by default; `-seed=false` exits after downloading.
+Local tests verify uploads during an active download, rejection of malformed and
+unavailable-piece requests, continued tracker updates during seeding, and shutdown.
+
+A TUI remains unfinished. A batch prepares outbound connections sequentially; new
+tracker peers join subsequent batches rather than being added to an active group.
+Uploads are currently served through incoming connections. Canceling a peer group
+closes its connections and joins its workers before returning. Incoming server
+shutdown closes the listener and joins handlers and their readers. CLI Ctrl+C and
+SIGTERM cancel the session; discovery waits and tracker-worker cooldowns also
+support cancellation. Immediate cancellation of in-flight tracker HTTP calls and
+outbound peer preparation remains lifecycle work; those operations currently have
+bounded timeouts.
 
 ## First-release features and acceptance criteria
 
@@ -228,8 +238,8 @@ tests, and a focused commit. These are learning steps, not fixed dates.
 | 1 | Separate session progress from a peer; sequential fallback | Complete | Peer A fails; B finishes while completed pieces remain intact; fatal storage failures stop retries |
 | 2 | Tracker lifecycle and rediscovery | Complete | Correct current statistics/events and replacement peer discovery with bounded retries |
 | 3 | Concurrent peer scheduling | Complete | Complementary peers transfer concurrently; assignments recover on failure; race checks pass |
-| 4 | Incoming connections, uploading, and seeding | Next | Valid requests receive verified stored data; completion transitions to seeding |
-| 5 | Shared status/cancellation and TUI | Planned | CLI and responsive TUI share the transfer engine; clean stop/quit |
+| 4 | Incoming connections, uploading, and seeding | Complete | Valid requests receive verified stored data; completion transitions to seeding |
+| 5 | Shared status/cancellation and TUI | Next | CLI and responsive TUI share the transfer engine; clean stop/quit |
 | 6 | Release verification and user documentation | Planned | Controlled complete transfers, recovery/seeding scenarios, installation/use instructions, and explicit limitations |
 
 Implement cancellation support when workers first need it; milestone 5 exposes
@@ -258,6 +268,6 @@ Before adding a deferred feature, explicitly decide whether it is required for
 this release or belongs to a later milestone, and update this document. Avoid
 expanding the current task merely because an extension would be useful.
 
-Session progress, tracker lifecycle/rediscovery, and concurrent peer scheduling
-are implemented. The next milestone adds incoming connections, uploading verified
-pieces, and continuing to seed after download completion.
+Session progress, tracker lifecycle/rediscovery, concurrent peer scheduling,
+incoming uploads, and seeding are implemented. The next milestone adds shared
+status reporting and a TUI, building on the existing cancellation support.

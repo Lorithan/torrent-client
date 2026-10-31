@@ -299,6 +299,110 @@ func TestSessionAvailabilitySnapshotsAreIndependent(t *testing.T) {
 	}
 }
 
+func TestSessionAvailabilitySnapshot(t *testing.T) {
+	tf := &torrent.TorrentFile{Length: 36, PieceLength: 4, Pieces: make([][20]byte, 9)}
+	s, err := NewSession(tf, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, changed := s.availabilitySnapshot()
+	if changed == nil {
+		t.Fatal("notification channel is nil")
+	}
+	select {
+	case <-changed:
+		t.Fatal("notification channel starts closed")
+	default:
+	}
+	_, unchanged := s.availabilitySnapshot()
+	if changed != unchanged {
+		t.Error("snapshots without a completion returned different notification channels")
+	}
+	if err := s.markComplete(8); err != nil {
+		t.Fatal(err)
+	}
+	current, next := s.availabilitySnapshot()
+	if initial.HasPiece(8) || !current.HasPiece(8) {
+		t.Error("snapshots did not preserve availability at the time of the call")
+	}
+	if next == nil {
+		t.Error("current notification channel is nil")
+	}
+	current[0], current[1] = 255, 255
+	if s.HasPiece(0) || !s.HasPiece(8) || !bytes.Equal(s.Availability(), []byte{0, 0x80}) {
+		t.Error("snapshot mutation changed session availability")
+	}
+}
+
+func TestSessionAvailabilityNotifications(t *testing.T) {
+	s, err := NewSession(&torrent.TorrentFile{Length: 8, PieceLength: 4, Pieces: make([][20]byte, 2)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, changed := s.availabilitySnapshot()
+	results := make(chan peer.Bitfield, 4)
+	for range 4 {
+		go func() {
+			<-changed
+			available, _ := s.availabilitySnapshot()
+			results <- available
+		}()
+	}
+	if err := s.markComplete(0); err != nil {
+		t.Fatal(err)
+	}
+	for range 4 {
+		select {
+		case available := <-results:
+			if !available.HasPiece(0) || available.HasPiece(1) {
+				t.Errorf("watcher saw availability %x, want only piece zero", available)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("completion did not notify every watcher")
+		}
+	}
+	_, next := s.availabilitySnapshot()
+	if next == changed {
+		t.Fatal("completion did not replace notification channel")
+	}
+	select {
+	case <-next:
+		t.Fatal("replacement channel is already closed")
+	default:
+	}
+	for _, index := range []int{0, -1, 2} {
+		if err := s.markComplete(index); err == nil {
+			t.Fatalf("markComplete(%d) unexpectedly succeeded", index)
+		}
+		_, afterFailure := s.availabilitySnapshot()
+		if afterFailure != next {
+			t.Error("failed completion replaced notification channel")
+		}
+		select {
+		case <-next:
+			t.Fatal("failed completion notified watchers")
+		default:
+		}
+	}
+	if err := s.markComplete(1); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-next:
+	default:
+		t.Error("next completion did not close replacement channel")
+	}
+	final, latest := s.availabilitySnapshot()
+	if !final.HasPiece(0) || !final.HasPiece(1) || latest == next {
+		t.Error("final completion did not publish new availability and channel")
+	}
+	select {
+	case <-latest:
+		t.Error("latest channel should remain open")
+	default:
+	}
+}
+
 func TestSessionProgressQueriesDuringCompletion(t *testing.T) {
 	const pieceCount = 65
 	tf := &torrent.TorrentFile{Length: pieceCount, PieceLength: 1, Pieces: make([][20]byte, pieceCount)}
