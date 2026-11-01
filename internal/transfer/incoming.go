@@ -1,4 +1,4 @@
-package main
+package transfer
 
 import (
 	"context"
@@ -41,7 +41,7 @@ func prepareIncomingPeer(
 	return client, err
 }
 
-func serveIncomingPeer(
+func (e *Engine) serveIncomingPeer(
 	ctx context.Context,
 	conn net.Conn,
 	local peer.Handshake,
@@ -65,11 +65,12 @@ func serveIncomingPeer(
 		}
 		return err
 	}
+	client.Conn = e.trackPeer(client.Conn)
 
 	return session.ServePeer(ctx, client)
 }
 
-func serveIncomingPeers(
+func (e *Engine) serveIncomingPeers(
 	ctx context.Context,
 	listener net.Listener,
 	local peer.Handshake,
@@ -122,7 +123,7 @@ func serveIncomingPeers(
 				}
 				defer release()
 
-				err := serveIncomingPeer(childCtx, conn, local, pieceCount, session)
+				err := e.serveIncomingPeer(childCtx, conn, local, pieceCount, session)
 				if err != nil {
 					if !errors.Is(err, context.Canceled) {
 						log.Printf("error serving peer: %v", err)

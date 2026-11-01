@@ -403,6 +403,110 @@ func TestSessionAvailabilityNotifications(t *testing.T) {
 	}
 }
 
+func TestSessionProgressSnapshot(t *testing.T) {
+	s, err := NewSession(&torrent.TorrentFile{Name: "file.bin", Length: 10, PieceLength: 4, Pieces: make([][20]byte, 3)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Progress{Name: "file.bin", TotalBytes: 10, TotalPieces: 3, Stats: Stats{Left: 10}}
+	if got := s.Progress(); got != want {
+		t.Fatalf("initial progress=%+v, want %+v", got, want)
+	}
+	// Transport counters can include retries and are independent of verified bytes.
+	s.stateMu.Lock()
+	s.stats.Downloaded, s.stats.Uploaded = 14, 3
+	s.stateMu.Unlock()
+	want.Stats.Downloaded, want.Stats.Uploaded = 14, 3
+	for _, tc := range []struct {
+		index    int
+		verified int64
+	}{{2, 2}, {0, 6}, {1, 10}} {
+		if err := s.markComplete(tc.index); err != nil {
+			t.Fatal(err)
+		}
+		want.CompletedPieces++
+		want.VerifiedBytes = tc.verified
+		want.Stats.Left = want.TotalBytes - tc.verified
+		if got := s.Progress(); got != want {
+			t.Fatalf("progress after piece %d=%+v, want %+v", tc.index, got, want)
+		}
+	}
+	copy := s.Progress()
+	copy.Name = "changed"
+	copy.TotalBytes, copy.VerifiedBytes = 0, 0
+	copy.CompletedPieces, copy.TotalPieces = 0, 0
+	copy.Stats = Stats{}
+	if got := s.Progress(); got != want {
+		t.Errorf("caller mutation changed session progress: %+v", got)
+	}
+	if copy == want {
+		t.Fatal("test did not modify snapshot")
+	}
+	before := s.Progress()
+	if err := s.markComplete(1); err == nil {
+		t.Fatal("duplicate completion succeeded")
+	}
+	if got := s.Progress(); got != before {
+		t.Error("failed completion changed progress")
+	}
+}
+
+func TestSessionProgressEmptyTorrent(t *testing.T) {
+	s, err := NewSession(&torrent.TorrentFile{Name: "empty", PieceLength: 4}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := s.Progress(), (Progress{Name: "empty"}); got != want {
+		t.Errorf("empty progress=%+v, want %+v", got, want)
+	}
+}
+
+func TestSessionProgressSnapshotDuringCompletion(t *testing.T) {
+	const count = 65
+	const length = 257
+	s, err := NewSession(&torrent.TorrentFile{Name: "concurrent", Length: length, PieceLength: 4, Pieces: make([][20]byte, count)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	failures := make(chan Progress, 4)
+	var readers, ready sync.WaitGroup
+	for range 4 {
+		ready.Add(1)
+		readers.Go(func() {
+			_ = s.Progress()
+			ready.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				p := s.Progress()
+				if p.Name != "concurrent" || p.TotalBytes != length || p.TotalPieces != count || p.CompletedPieces < 0 || p.CompletedPieces > count || p.VerifiedBytes != min(int64(p.CompletedPieces)*4, length) || p.Stats.Left != length-p.VerifiedBytes {
+					failures <- p
+					return
+				}
+			}
+		})
+	}
+	ready.Wait()
+	for index := range count {
+		if err := s.markComplete(index); err != nil {
+			t.Error(err)
+		}
+	}
+	close(stop)
+	readers.Wait()
+	close(failures)
+	for p := range failures {
+		t.Errorf("inconsistent snapshot: %+v", p)
+	}
+	if p := s.Progress(); p.VerifiedBytes != length || p.CompletedPieces != count || p.Stats.Left != 0 {
+		t.Errorf("final progress=%+v", p)
+	}
+}
+
 func TestSessionProgressQueriesDuringCompletion(t *testing.T) {
 	const pieceCount = 65
 	tf := &torrent.TorrentFile{Length: pieceCount, PieceLength: 1, Pieces: make([][20]byte, pieceCount)}

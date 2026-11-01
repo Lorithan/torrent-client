@@ -1,4 +1,4 @@
-package main
+package transfer
 
 import (
 	"context"
@@ -164,4 +164,132 @@ func preparePeerBatch(
 	}
 
 	return results, nil
+}
+
+func preparePeer(addr net.TCPAddr, local peer.Handshake, pieceCount int) (*peer.Client, error) {
+	conn, received, err := peer.Connect(addr, local)
+	if err != nil {
+		return nil, &download.PeerError{
+			Op:  fmt.Sprintf("connect to peer at addr %s", addr.String()),
+			Err: err,
+		}
+	}
+
+	log.Printf("recieved peerID: %x", received.PeerID)
+
+	client, err := peer.NewClient(conn, *received, pieceCount)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	err = client.Conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if err != nil {
+		conn.Close()
+		return nil, &download.PeerError{
+			Op:  "set unchoke deadline",
+			Err: err,
+		}
+	}
+	err = client.WaitForUnchoke()
+	if err != nil {
+		conn.Close()
+		return nil, &download.PeerError{
+			Op:  "wait for unchoke",
+			Err: err,
+		}
+	}
+	err = client.Conn.SetDeadline(time.Time{})
+	if err != nil {
+		conn.Close()
+		return nil, &download.PeerError{
+			Op:  "clear unchoke deadline",
+			Err: err,
+		}
+	}
+
+	return client, nil
+}
+
+func (e *Engine) downloadFromPeers(
+	ctx context.Context,
+	refresh chan<- struct{},
+	peers *peerQueue,
+	local peer.Handshake,
+	pieceCount int,
+	session *download.Session,
+) error {
+	const attemptsAllowed = 3
+
+	attempts := 0
+	left := session.Stats().Left
+	for {
+		newLeft := session.Stats().Left
+		if newLeft < left {
+			left = newLeft
+			attempts = 0
+		}
+
+		err := ctx.Err()
+		if err != nil {
+			return err
+		}
+
+		if session.Complete() {
+			return nil
+		}
+
+		var peerErr *download.PeerError
+
+		e.setPhase(PhaseConnecting)
+		preparedPeers, err := preparePeerBatch(ctx, peers, local, pieceCount, e.config.Workers)
+		if err != nil {
+			return err
+		}
+		if len(preparedPeers) > 0 {
+			for _, client := range preparedPeers {
+				client.Conn = e.trackPeer(client.Conn)
+			}
+
+			e.setPhase(PhaseDownloading)
+			err := session.DownloadFromPeers(ctx, preparedPeers, e.config.Workers)
+			if err != nil {
+				retryable := errors.As(err, &peerErr)
+				if retryable {
+					log.Printf("error downloading from peers: %s", err)
+					continue
+				} else {
+					return err
+				}
+			} else {
+				continue
+			}
+		}
+
+		addr, next := peers.Next()
+		if !next {
+			if attempts == attemptsAllowed {
+				return fmt.Errorf("exceed peer discovery attempts")
+			}
+			attempts += 1
+
+			e.setPhase(PhaseWaiting)
+			addr, err = waitForPeer(ctx, refresh, peers, e.config.PeerWaitTimeout)
+			if err != nil {
+				if cancelled := ctx.Err(); cancelled != nil {
+					return cancelled
+				}
+				if err == context.DeadlineExceeded {
+					continue
+				}
+
+				return err
+			}
+		}
+		peers.Add([]net.TCPAddr{addr})
+
+		if session.Complete() {
+			return nil
+		}
+	}
 }

@@ -1,4 +1,4 @@
-package main
+package transfer
 
 import (
 	"bytes"
@@ -140,7 +140,7 @@ func TestServeIncomingPeerAlreadyCanceledClosesConnection(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := serveIncomingPeer(ctx, local, peer.Handshake{}, 0, nil); !errors.Is(err, context.Canceled) {
+	if err := (&Engine{}).serveIncomingPeer(ctx, local, peer.Handshake{}, 0, nil); !errors.Is(err, context.Canceled) {
 		t.Errorf("error=%v, want context.Canceled", err)
 	}
 	var data [1]byte
@@ -168,7 +168,7 @@ func TestServeIncomingPeerCancellationDuringHandshake(t *testing.T) {
 	t.Cleanup(func() { cancel(); local.Close(); remote.Close() })
 	conn := &incomingReadGateConn{Conn: local, reading: make(chan struct{}, 1)}
 	done := make(chan error, 1)
-	go func() { done <- serveIncomingPeer(ctx, conn, peer.Handshake{}, 0, nil) }()
+	go func() { done <- (&Engine{}).serveIncomingPeer(ctx, conn, peer.Handshake{}, 0, nil) }()
 	select {
 	case <-conn.reading:
 	case <-time.After(2 * time.Second):
@@ -186,6 +186,7 @@ func TestServeIncomingPeerCancellationDuringHandshake(t *testing.T) {
 }
 
 func TestServeIncomingPeerHandsOffToSession(t *testing.T) {
+	e := &Engine{}
 	session, err := download.NewSession(&torrent.TorrentFile{PieceLength: 4}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -200,7 +201,7 @@ func TestServeIncomingPeerHandsOffToSession(t *testing.T) {
 	remoteHandshake := handshake
 	remoteHandshake.PeerID = [20]byte{'r'}
 	done := make(chan error, 1)
-	go func() { done <- serveIncomingPeer(ctx, local, handshake, 0, session) }()
+	go func() { done <- e.serveIncomingPeer(ctx, local, handshake, 0, session) }()
 	if _, err := remote.Write(remoteHandshake.Serialize()); err != nil {
 		t.Fatal(err)
 	}
@@ -212,6 +213,9 @@ func TestServeIncomingPeerHandsOffToSession(t *testing.T) {
 	if err != nil || msg == nil || msg.ID != peer.MsgBitfield || len(msg.Payload) != 0 {
 		t.Fatalf("initial availability=%v, err=%v", msg, err)
 	}
+	if got := e.Status().ActivePeers; got != 1 {
+		t.Errorf("active peers after incoming setup=%d, want 1", got)
+	}
 	cancel()
 	select {
 	case err := <-done:
@@ -220,6 +224,9 @@ func TestServeIncomingPeerHandsOffToSession(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("serving did not stop after cancellation")
+	}
+	if got := e.Status().ActivePeers; got != 0 {
+		t.Errorf("active peers after incoming shutdown=%d, want 0", got)
 	}
 }
 
@@ -284,7 +291,7 @@ func TestServeIncomingPeersBoundsHandshakesAndJoinsOnExit(t *testing.T) {
 			})
 			gate := &incomingReadGateConn{Conn: first, reading: make(chan struct{}, 1)}
 			done := make(chan error, 1)
-			go func() { done <- serveIncomingPeers(ctx, listener, peer.Handshake{}, 0, nil, 1) }()
+			go func() { done <- (&Engine{}).serveIncomingPeers(ctx, listener, peer.Handshake{}, 0, nil, 1) }()
 			offerIncomingTestConn(t, listener, gate)
 			select {
 			case <-gate.reading:
@@ -325,7 +332,7 @@ func TestServeIncomingPeersBoundsHandshakesAndJoinsOnExit(t *testing.T) {
 func TestServeIncomingPeersInvalidLimitClosesListener(t *testing.T) {
 	for _, limit := range []int{0, -1} {
 		listener := newIncomingTestListener()
-		if err := serveIncomingPeers(context.Background(), listener, peer.Handshake{}, 0, nil, limit); err == nil {
+		if err := (&Engine{}).serveIncomingPeers(context.Background(), listener, peer.Handshake{}, 0, nil, limit); err == nil {
 			t.Errorf("limit=%d returned nil error", limit)
 		}
 		select {

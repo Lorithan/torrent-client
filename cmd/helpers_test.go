@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -187,4 +188,16 @@ func fallbackTestExpectClosed(conn net.Conn) error {
 		return fmt.Errorf("expected peer cleanup without another request or have, got byte %x and error %v", next, err)
 	}
 	return nil
+}
+
+func expectIncomingTestEOF(t *testing.T, conn net.Conn) {
+	t.Helper()
+	// net.Pipe can reject setting a deadline after its other endpoint closes.
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatal(err)
+	}
+	var data [1]byte
+	if _, err := conn.Read(data[:]); !errors.Is(err, io.EOF) {
+		t.Errorf("read error=%v, want EOF", err)
+	}
 }

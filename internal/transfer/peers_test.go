@@ -1,4 +1,4 @@
-package main
+package transfer
 
 import (
 	"bytes"
@@ -18,10 +18,140 @@ import (
 	"github.com/lorithan/torrent-client/internal/torrent"
 )
 
+// This fixture exercises peer orchestration without starting engine-owned files or trackers.
+func peerDownloadTestEngine(workers int, timeout time.Duration) *Engine {
+	return &Engine{config: Config{Workers: workers, PeerWaitTimeout: timeout}}
+}
+
 func testPeerQueue(addrs ...net.TCPAddr) *peerQueue {
 	q := newPeerQueue()
 	q.Add(addrs)
 	return q
+}
+
+func TestDownloadFromPeersReportsWaiting(t *testing.T) {
+	session, err := download.NewSession(&torrent.TorrentFile{Length: 4, PieceLength: 4, Pieces: make([][20]byte, 1)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := peerDownloadTestEngine(1, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	refresh := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	t.Cleanup(cancel)
+	go func() { done <- e.downloadFromPeers(ctx, refresh, newPeerQueue(), peer.Handshake{}, 1, session) }()
+	select {
+	case <-refresh:
+	case <-time.After(time.Second):
+		t.Fatal("peer wait did not request tracker refresh")
+	}
+	if got := e.Status().Phase; got != PhaseWaiting {
+		t.Errorf("phase=%s, want waiting", got)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("error=%v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("peer wait did not stop")
+	}
+}
+
+func TestDownloadFromPeersReportsConnectingAndDownloading(t *testing.T) {
+	handshakeStarted, releaseHandshake := make(chan struct{}), make(chan struct{})
+	requestStarted, releaseBlock := make(chan struct{}), make(chan struct{})
+	var handshakeOnce, blockOnce sync.Once
+	release := func() {
+		handshakeOnce.Do(func() { close(releaseHandshake) })
+		blockOnce.Do(func() { close(releaseBlock) })
+	}
+	t.Cleanup(release)
+	local := peer.Handshake{InfoHash: [20]byte{1}}
+	addr, peerDone := startFallbackTestPeerWithVerifier(t, local, func(conn net.Conn) error {
+		for index := range uint32(2) {
+			if err := fallbackTestRequest(conn, index); err != nil {
+				return err
+			}
+			if index == 0 {
+				close(requestStarted)
+				<-releaseBlock
+			}
+			if err := fallbackTestReply(conn, index, []byte("data")); err != nil {
+				return err
+			}
+			if err := fallbackTestHave(conn, index); err != nil {
+				return err
+			}
+		}
+		return fallbackTestExpectClosed(conn)
+	}, func(wire [68]byte) error { close(handshakeStarted); <-releaseHandshake; return nil })
+	hash := sha1.Sum([]byte("data"))
+	session, err := download.NewSession(&torrent.TorrentFile{Length: 8, PieceLength: 4, Pieces: [][20]byte{hash, hash}}, &fallbackTestWriter{data: make([]byte, 8)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := peerDownloadTestEngine(1, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var downloadErr error
+	t.Cleanup(func() {
+		release()
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("peer orchestration did not stop")
+		}
+	})
+	go func() {
+		defer close(done)
+		downloadErr = e.downloadFromPeers(ctx, nil, testPeerQueue(addr), local, 2, session)
+	}()
+	select {
+	case <-handshakeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("handshake did not start")
+	}
+	if got := e.Status().Phase; got != PhaseConnecting {
+		t.Errorf("phase=%s, want connecting", got)
+	}
+	if got := e.Status().ActivePeers; got != 0 {
+		t.Errorf("active peers during handshake=%d, want 0", got)
+	}
+	handshakeOnce.Do(func() { close(releaseHandshake) })
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("block request did not start")
+	}
+	if got := e.Status().Phase; got != PhaseDownloading {
+		t.Errorf("phase=%s, want downloading", got)
+	}
+	if got := e.Status().ActivePeers; got != 1 {
+		t.Errorf("active peers during transfer=%d, want 1", got)
+	}
+	blockOnce.Do(func() { close(releaseBlock) })
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("download did not finish")
+	}
+	if downloadErr != nil {
+		t.Fatal(downloadErr)
+	}
+	if got := e.Status().ActivePeers; got != 0 {
+		t.Errorf("active peers after worker cleanup=%d, want 0", got)
+	}
+	select {
+	case err := <-peerDone:
+		if err != nil {
+			t.Errorf("peer: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("peer did not finish")
+	}
 }
 
 func TestPreparePeerBatchSkipsPeerFailuresAndBoundsAttempts(t *testing.T) {
@@ -180,7 +310,7 @@ func TestDownloadFromPeersRetainsQueuedAddressAfterEmptyBatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	refresh := make(chan struct{}, 4)
-	err = downloadFromPeers(ctx, refresh, testPeerQueue(badFirst, badSecond, good), local, 2, 2, s, 10*time.Millisecond)
+	err = peerDownloadTestEngine(2, 10*time.Millisecond).downloadFromPeers(ctx, refresh, testPeerQueue(badFirst, badSecond, good), local, 2, s)
 	if err != nil {
 		t.Fatalf("good peer after empty batch was dropped: %v", err)
 	}
@@ -364,7 +494,7 @@ func TestDownloadFromPeersUsesFirstDiscoveredPeer(t *testing.T) {
 		case <-ctx.Done():
 		}
 	}()
-	err = downloadFromPeers(ctx, refresh, q, local, 2, 1, session, 25*time.Millisecond)
+	err = peerDownloadTestEngine(1, 25*time.Millisecond).downloadFromPeers(ctx, refresh, q, local, 2, session)
 	cancel()
 	<-workerDone
 	if err != nil || !session.Complete() {
@@ -410,7 +540,7 @@ func TestDownloadFromPeersBoundsRediscoveryWithoutProgress(t *testing.T) {
 			}
 		}
 	}()
-	err = downloadFromPeers(ctx, refresh, q, peer.Handshake{}, 1, 1, session, 25*time.Millisecond)
+	err = peerDownloadTestEngine(1, 25*time.Millisecond).downloadFromPeers(ctx, refresh, q, peer.Handshake{}, 1, session)
 	cancel()
 	count := <-counts
 	if count != 3 {
@@ -480,7 +610,7 @@ func TestDownloadFromPeersResetsDiscoveryBudgetAfterProgress(t *testing.T) {
 			}
 		}
 	}()
-	err = downloadFromPeers(ctx, refresh, q, local, 2, 1, session, 25*time.Millisecond)
+	err = peerDownloadTestEngine(1, 25*time.Millisecond).downloadFromPeers(ctx, refresh, q, local, 2, session)
 	cancel()
 	count := <-counts
 	if err != nil || !session.Complete() || !bytes.Equal(dst.data, []byte("abcdefgh")) {
@@ -810,7 +940,7 @@ func TestDownloadFromPeersRetriesAfterHandshakeFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := downloadFromPeers(context.Background(), nil, testPeerQueue(bad, good), local, 2, 1, session, 25*time.Millisecond); err != nil {
+	if err := peerDownloadTestEngine(1, 25*time.Millisecond).downloadFromPeers(context.Background(), nil, testPeerQueue(bad, good), local, 2, session); err != nil {
 		t.Fatal(err)
 	}
 	if !session.Complete() || !bytes.Equal(dst.data, []byte("datadata")) {
@@ -834,7 +964,7 @@ func TestDownloadFromPeersAllPreparationsFail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := downloadFromPeers(context.Background(), nil, testPeerQueue(first, second), local, 1, 1, session, 25*time.Millisecond); err == nil {
+	if err := peerDownloadTestEngine(1, 25*time.Millisecond).downloadFromPeers(context.Background(), nil, testPeerQueue(first, second), local, 1, session); err == nil {
 		t.Error("expected peer exhaustion error")
 	}
 	if session.Complete() || dst.calls != 0 {
@@ -854,7 +984,7 @@ func TestDownloadFromPeersNoAddressesWhileIncomplete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := downloadFromPeers(context.Background(), nil, newPeerQueue(), peer.Handshake{}, 1, 1, session, 25*time.Millisecond); err == nil {
+	if err := peerDownloadTestEngine(1, 25*time.Millisecond).downloadFromPeers(context.Background(), nil, newPeerQueue(), peer.Handshake{}, 1, session); err == nil {
 		t.Error("expected peer exhaustion error")
 	}
 }
@@ -899,7 +1029,7 @@ func TestDownloadFromPeersContinuesAfterInterruptedPiece(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := downloadFromPeers(context.Background(), nil, testPeerQueue(first, second), local, 2, 1, s, 25*time.Millisecond); err != nil {
+	if err := peerDownloadTestEngine(1, 25*time.Millisecond).downloadFromPeers(context.Background(), nil, testPeerQueue(first, second), local, 2, s); err != nil {
 		t.Fatal(err)
 	}
 	if !s.Complete() || dst.calls != 2 || !bytes.Equal(dst.data, []byte("abcdefgh")) {
@@ -918,7 +1048,7 @@ func TestDownloadFromPeersCompletedSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := downloadFromPeers(context.Background(), nil, newPeerQueue(), peer.Handshake{}, 0, 1, s, 25*time.Millisecond); err != nil {
+	if err := peerDownloadTestEngine(1, 25*time.Millisecond).downloadFromPeers(context.Background(), nil, newPeerQueue(), peer.Handshake{}, 0, s); err != nil {
 		t.Errorf("already completed session should succeed without peers: %v", err)
 	}
 }
@@ -962,7 +1092,7 @@ func TestDownloadFromPeersStopsOnStorageError(t *testing.T) {
 		conn.Close()
 		attempted <- true
 	}()
-	err = downloadFromPeers(context.Background(), nil, testPeerQueue(addr, *spare.Addr().(*net.TCPAddr)), local, 2, 1, s, 25*time.Millisecond)
+	err = peerDownloadTestEngine(1, 25*time.Millisecond).downloadFromPeers(context.Background(), nil, testPeerQueue(addr, *spare.Addr().(*net.TCPAddr)), local, 2, s)
 	spare.Close()
 	if <-attempted {
 		t.Error("storage failure attempted a replacement peer")
@@ -1144,7 +1274,7 @@ func TestDownloadFromPeersRetriesCorruptPiece(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := downloadFromPeers(context.Background(), nil, testPeerQueue(bad, good), local, 2, 1, session, 25*time.Millisecond); err != nil {
+	if err := peerDownloadTestEngine(1, 25*time.Millisecond).downloadFromPeers(context.Background(), nil, testPeerQueue(bad, good), local, 2, session); err != nil {
 		t.Fatal(err)
 	}
 	if !session.Complete() || dst.calls != 2 || !bytes.Equal(dst.data, []byte("abcdefgh")) {
@@ -1188,7 +1318,7 @@ func TestDownloadFromPeersExhaustsTransferFailuresAndClosesConnections(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = downloadFromPeers(context.Background(), nil, testPeerQueue(corrupt, truncated), local, 2, 1, session, 25*time.Millisecond)
+	err = peerDownloadTestEngine(1, 25*time.Millisecond).downloadFromPeers(context.Background(), nil, testPeerQueue(corrupt, truncated), local, 2, session)
 	if err == nil || !strings.Contains(err.Error(), "peer discovery attempts") {
 		t.Errorf("error = %v, want exhaustion", err)
 	}
