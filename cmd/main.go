@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/lorithan/torrent-client/internal/transfer"
+	"github.com/lorithan/torrent-client/internal/tui"
 )
 
 func main() {
@@ -31,6 +32,8 @@ func run(ctx context.Context, waitTimeout time.Duration) error {
 	nPort := flag.Int("port", 0, "port number to listen on")
 	workers := flag.Int("workers", 4, "number of workers dedicated to downloading")
 	seed := flag.Bool("seed", true, "continue seed the torrent after download is complete")
+	useTUI := flag.Bool("tui", false, "Use the tui version of the command")
+	logPath := flag.String("log", "torrent-client.log", "where to redirect logging")
 
 	flag.Parse()
 
@@ -65,5 +68,18 @@ func run(ctx context.Context, waitTimeout time.Duration) error {
 		return err
 	}
 
-	return engine.Run(ctx)
+	if *useTUI {
+		logCleanup, err := redirectLogs(*logPath)
+		if err != nil {
+			return err
+		}
+		runErr := tui.Run(ctx, engine)
+		err = logCleanup()
+		if err != nil {
+			return err
+		}
+		return runErr
+	} else {
+		return engine.Run(ctx)
+	}
 }

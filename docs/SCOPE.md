@@ -79,7 +79,22 @@ The CLI seeds after completion by default; `-seed=false` exits after downloading
 Local tests verify uploads during an active download, rejection of malformed and
 unavailable-piece requests, continued tracker updates during seeding, and shutdown.
 
-A TUI remains unfinished. A batch prepares outbound connections sequentially; new
+The CLI and Bubble Tea/Lip Gloss TUI now share `internal/transfer.Engine`. It
+publishes synchronized snapshots of phase, progress, data rates, active peer
+connections, and terminal errors. TUI commands keep transfer work outside the
+event loop; status refreshes, keyboard cancellation, and resize messages remain
+responsive while the engine runs. The TUI waits for engine cleanup before
+quitting, including when terminal startup or the terminal program fails.
+Diagnostic logs go to a file in TUI mode. Binary units, percentages, styled
+failures, wrapping, and a compact fallback keep status and controls readable.
+
+Real-engine TUI tests use local trackers and peers to verify partial progress,
+resizing, seeding uploads, cancellation during a stalled download, final file
+contents, tracker events/counters, and failure display. A pseudo-terminal check
+also downloaded 32 KiB, resized to compact mode and back, uploaded verified seed
+data, and quit cleanly with diagnostics separated from the terminal.
+
+A batch prepares outbound connections sequentially; new
 tracker peers join subsequent batches rather than being added to an active group.
 Uploads are currently served through incoming connections. Canceling a peer group
 closes its connections and joins its workers before returning. Incoming server
@@ -239,8 +254,8 @@ tests, and a focused commit. These are learning steps, not fixed dates.
 | 2 | Tracker lifecycle and rediscovery | Complete | Correct current statistics/events and replacement peer discovery with bounded retries |
 | 3 | Concurrent peer scheduling | Complete | Complementary peers transfer concurrently; assignments recover on failure; race checks pass |
 | 4 | Incoming connections, uploading, and seeding | Complete | Valid requests receive verified stored data; completion transitions to seeding |
-| 5 | Shared status/cancellation and TUI | Next | CLI and responsive TUI share the transfer engine; clean stop/quit |
-| 6 | Release verification and user documentation | Planned | Controlled complete transfers, recovery/seeding scenarios, installation/use instructions, and explicit limitations |
+| 5 | Shared status/cancellation and TUI | Complete | CLI and responsive TUI share the transfer engine; clean stop/quit |
+| 6 | Release verification and user documentation | Next | Controlled complete transfers, recovery/seeding scenarios, installation/use instructions, and explicit limitations |
 
 Implement cancellation support when workers first need it; milestone 5 exposes
 and integrates it with the UI rather than postponing worker shutdown design.
@@ -269,5 +284,6 @@ this release or belongs to a later milestone, and update this document. Avoid
 expanding the current task merely because an extension would be useful.
 
 Session progress, tracker lifecycle/rediscovery, concurrent peer scheduling,
-incoming uploads, and seeding are implemented. The next milestone adds shared
-status reporting and a TUI, building on the existing cancellation support.
+incoming uploads, seeding, shared status reporting, and the TUI are implemented.
+The next milestone consolidates release verification and user documentation,
+including reproducible manual scenarios and explicit platform/protocol limits.
