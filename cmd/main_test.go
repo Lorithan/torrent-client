@@ -136,8 +136,18 @@ func TestRunContinuesWithSecondPeer(t *testing.T) {
 // run uses the standard flag set and logger; isolate their process-wide state
 // between tests. These tests must remain sequential.
 func TestRunWorkerFlagEnablesOverlappingPeerRequests(t *testing.T) {
-	firstHash, secondHash := sha1.Sum([]byte("abcd")), sha1.Sum([]byte("efgh"))
-	info := "d6:lengthi8e4:name8:file.bin12:piece lengthi4e6:pieces40:" + string(firstHash[:]) + string(secondHash[:]) + "e"
+	for _, finalPiece := range []string{"efgh", "ef"} {
+		t.Run(fmt.Sprintf("final_piece_bytes=%d", len(finalPiece)), func(t *testing.T) {
+			runOverlappingPeerTransfer(t, finalPiece)
+		})
+	}
+}
+
+func runOverlappingPeerTransfer(t *testing.T, finalPiece string) {
+	t.Helper()
+	fileLength := 4 + len(finalPiece)
+	firstHash, secondHash := sha1.Sum([]byte("abcd")), sha1.Sum([]byte(finalPiece))
+	info := fmt.Sprintf("d6:lengthi%de4:name8:file.bin12:piece lengthi4e6:pieces40:", fileLength) + string(firstHash[:]) + string(secondHash[:]) + "e"
 	local := peer.Handshake{InfoHash: sha1.Sum([]byte(info))}
 	announcedIDs := make(chan string, 2)
 	verify := func(wire [68]byte) error {
@@ -161,12 +171,19 @@ func TestRunWorkerFlagEnablesOverlappingPeerRequests(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if request == nil || request.ID != peer.MsgRequest || len(request.Payload) != 12 || binary.BigEndian.Uint32(request.Payload[4:8]) != 0 || binary.BigEndian.Uint32(request.Payload[8:]) != 4 {
+		if request == nil || request.ID != peer.MsgRequest || len(request.Payload) != 12 || binary.BigEndian.Uint32(request.Payload[4:8]) != 0 {
 			return fmt.Errorf("unexpected request: %+v", request)
 		}
 		index := binary.BigEndian.Uint32(request.Payload[:4])
 		if index > 1 {
 			return fmt.Errorf("invalid piece index %d", index)
+		}
+		length := 4
+		if index == 1 {
+			length = len(finalPiece)
+		}
+		if got := binary.BigEndian.Uint32(request.Payload[8:]); got != uint32(length) {
+			return fmt.Errorf("piece %d requested %d bytes, want %d", index, got, length)
 		}
 		requests <- index
 		select {
@@ -176,9 +193,13 @@ func TestRunWorkerFlagEnablesOverlappingPeerRequests(t *testing.T) {
 		}
 		data := []byte("abcd")
 		if index == 1 {
-			data = []byte("efgh")
+			data = []byte(finalPiece)
 		}
-		if err := fallbackTestReply(conn, index, data); err != nil {
+		piece, err := peer.NewPiece(index, 0, data)
+		if err != nil {
+			return err
+		}
+		if _, err := conn.Write(piece.Serialize()); err != nil {
 			return err
 		}
 		if err := fallbackTestHave(conn, index); err != nil {
@@ -252,7 +273,7 @@ func TestRunWorkerFlagEnablesOverlappingPeerRequests(t *testing.T) {
 		}
 	}
 	output, err := os.ReadFile(outputPath)
-	if err != nil || string(output) != "abcdefgh" {
+	if err != nil || string(output) != "abcd"+finalPiece {
 		t.Errorf("output = %q, error %v", output, err)
 	}
 	if len(announces) != 3 {
@@ -272,7 +293,7 @@ func TestRunWorkerFlagEnablesOverlappingPeerRequests(t *testing.T) {
 				t.Errorf("announce identity changed for %s", key)
 			}
 		}
-		if event != "started" && (query.Get("left") != "0" || query.Get("downloaded") != "8") {
+		if event != "started" && (query.Get("left") != "0" || query.Get("downloaded") != strconv.Itoa(fileLength)) {
 			t.Errorf("incorrect final statistics: %v", query)
 		}
 	}

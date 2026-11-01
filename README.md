@@ -3,8 +3,8 @@
 A Go BitTorrent client built as a portfolio and learning project.
 
 The CLI and terminal UI share a transfer engine that discovers peers through an
-HTTP/HTTPS tracker and downloads from bounded
-groups of peers concurrently. It verifies piece SHA-1 hashes before writing,
+HTTP/HTTPS tracker and downloads from bounded groups of peers concurrently. It
+verifies piece SHA-1 hashes before writing,
 reassigns failed work, and preserves verified progress across peer groups. Tracker
 updates report session statistics and refresh discovery when peers are exhausted.
 Incoming peers receive verified pieces from storage, including availability updates
@@ -14,6 +14,25 @@ failures, with keyboard cancellation and a compact layout for small terminals.
 
 See [Project scope](docs/SCOPE.md) for the current baseline, confirmed release
 decisions, agreed feature boundaries, acceptance criteria, and milestone order.
+
+## Build
+
+Use Go 1.26.4 or later. Release checks currently target Linux amd64; other
+platforms are not verified. TUI mode requires an interactive terminal. Tests need
+permission to open loopback TCP sockets. Initial dependency downloads require
+network access; the controlled swarm scenarios themselves run locally.
+
+```sh
+git clone https://github.com/Lorithan/torrent-client.git
+cd torrent-client
+mkdir -p bin
+go build -trimpath -o ./bin/torrent-client ./cmd
+./bin/torrent-client -h
+```
+
+Run the built binary with the same flags shown below, or use `go run ./cmd` from
+the checkout. No public tracker or torrent is needed for the reproducible
+[local verification procedure](docs/VERIFYING.md).
 
 ## Usage
 
@@ -26,6 +45,16 @@ Add `-tui` for the terminal UI:
 ```sh
 go run ./cmd -tui -torrent ./input.torrent -output ./output.bin -log ./torrent-client.log
 ```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-torrent` | Required | Local single-file v1 `.torrent` path |
+| `-output` | Required | Explicit output path; existing files are refused |
+| `-port` | `0` | Listening port, `0` through `65535`; `0` asks the OS |
+| `-workers` | `4` | Maximum peers in each download batch; minimum `1` |
+| `-seed` | `true` | Continue uploading after download completion |
+| `-tui` | `false` | Enable the terminal UI |
+| `-log` | `torrent-client.log` | Append-only diagnostic log in TUI mode |
 
 CLI mode is the default. In TUI mode, diagnostic logs are appended to the `-log`
 path (default `torrent-client.log`); newly created log files use permissions
@@ -41,8 +70,8 @@ Seeding after completion is enabled by default. Use `-seed=false` to stop the
 transfer after downloading: the CLI exits, while the TUI retains its final screen
 until dismissed. In the TUI, press `q` or Ctrl+C to stop and quit; it waits for
 transfer cleanup before exiting. SIGTERM also stops the session. CLI Ctrl+C or
-SIGTERM stops the session and cleans up its background
-services. Incoming connections are limited to eight, including handshakes; excess
+SIGTERM stops the session and cleans up its background services. Incoming
+connections are limited to eight, including handshakes; excess
 connections are closed. Interested incoming peers are unchoked under this limit.
 
 The display shows verified bytes and percentage separately from transport
@@ -71,11 +100,24 @@ inbound reachability may require manual router configuration. Uploads are curren
 served through incoming connections. In-flight tracker HTTP requests and outbound
 peer preparation use bounded timeouts rather than immediate context cancellation.
 
+Partial output is retained after a stop or failure. There is no restart/resume:
+another invocation refuses that existing path, even if the file is incomplete.
+Choose a new output path or manage the partial file yourself. Parent output
+directories must already exist. Keep downloaded data outside the checkout;
+personal torrent files, logs, and ISO downloads are excluded from commits.
+
+UDP trackers, magnet links, DHT/PEX, announce tiers, multi-file and v2/hybrid
+torrents, IPv6 peers, automatic port mapping, pause/resume, and request pipelining
+are deferred. The supported discovery path is HTTP/HTTPS with compact or
+dictionary IPv4 peers. Detailed release limits and scenario commands are in
+[VERIFYING.md](docs/VERIFYING.md) and [SCOPE.md](docs/SCOPE.md).
+
 ## Tests
 
 ```sh
 go test ./...
-go test -race ./...
+go test -race ./... -count=1 -timeout=90s
+go vet ./...
 ```
 
 Some tests open loopback TCP connections for local fake trackers and peers.
@@ -83,3 +125,5 @@ They do not require public trackers or a real swarm.
 Real-engine TUI tests cover live partial progress, resizing, seeding uploads,
 failure display, and quit during a stalled transfer. Other tests cover terminal
 startup failures and joining transfer cleanup when the terminal program exits.
+See [VERIFYING.md](docs/VERIFYING.md) for the acceptance matrix and an opt-in local
+swarm that generates synthetic data in a directory you choose.

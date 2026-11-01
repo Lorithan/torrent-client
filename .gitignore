@@ -1,0 +1,6 @@
+# Local builds and runtime artifacts; test fixtures use temporary directories.
+/bin/
+/torrent-client
+*.log
+*.torrent
+*.iso

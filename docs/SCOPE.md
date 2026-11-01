@@ -255,7 +255,7 @@ tests, and a focused commit. These are learning steps, not fixed dates.
 | 3 | Concurrent peer scheduling | Complete | Complementary peers transfer concurrently; assignments recover on failure; race checks pass |
 | 4 | Incoming connections, uploading, and seeding | Complete | Valid requests receive verified stored data; completion transitions to seeding |
 | 5 | Shared status/cancellation and TUI | Complete | CLI and responsive TUI share the transfer engine; clean stop/quit |
-| 6 | Release verification and user documentation | Next | Controlled complete transfers, recovery/seeding scenarios, installation/use instructions, and explicit limitations |
+| 6 | Release verification and user documentation | Complete | Controlled complete transfers, recovery/seeding scenarios, installation/use instructions, and explicit limitations |
 
 Implement cancellation support when workers first need it; milestone 5 exposes
 and integrates it with the UI rather than postponing worker shutdown design.
@@ -274,7 +274,9 @@ signatures, worker counts, and timeout defaults are not locked by this document.
   paths. Linux amd64 is the current development environment; broader platform
   support is not a first-release promise.
 - Keep a small reproducible complete-download scenario and a seed/upload scenario
-  for manual verification. Public swarm tests supplement these fixtures.
+  for manual verification. [VERIFYING.md](VERIFYING.md) documents the opt-in local
+  swarm, expected hashes/counters, automated acceptance matrix, and current limits.
+  Public swarm tests supplement these fixtures.
 - Exclude personal torrent files and downloaded payloads from commits.
 
 ## Scope changes
@@ -285,5 +287,8 @@ expanding the current task merely because an extension would be useful.
 
 Session progress, tracker lifecycle/rediscovery, concurrent peer scheduling,
 incoming uploads, seeding, shared status reporting, and the TUI are implemented.
-The next milestone consolidates release verification and user documentation,
-including reproducible manual scenarios and explicit platform/protocol limits.
+All six agreed implementation milestones are complete. Release verification and
+user documentation include reproducible local scenarios, exact output hashes,
+and explicit platform/protocol limits. Follow-up features remain deferred until
+they are deliberately selected; publishing a version tag or GitHub release is a
+separate step.
