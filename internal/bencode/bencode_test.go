@@ -2,6 +2,35 @@ package bencode
 
 import "testing"
 
+func TestDecodeRejectsTruncatedAndOverflowingInput(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{name: "integer marker only", input: "i"},
+		{name: "integer sign only", input: "i-"},
+		{name: "unterminated integer", input: "i42"},
+		{name: "unterminated negative integer", input: "i-42"},
+		{name: "string length without colon", input: "4"},
+		{name: "string end offset overflows", input: "9223372036854775807:"},
+		{name: "truncated integer inside dictionary", input: "d8:intervali30"},
+		{name: "truncated string inside dictionary", input: "d5:peers6"},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if panicValue := recover(); panicValue != nil {
+					t.Fatalf("Decode(%q) panicked instead of returning an error: %v", tt.input, panicValue)
+				}
+			}()
+			if _, err := Decode([]byte(tt.input)); err == nil {
+				t.Fatalf("Decode(%q) should reject malformed input", tt.input)
+			}
+		})
+	}
+}
+
 func TestDecodeInt(t *testing.T) {
 	cases := []struct {
 		name    string

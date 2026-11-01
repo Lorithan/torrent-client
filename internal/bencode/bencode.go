@@ -13,7 +13,7 @@ func Decode(input []byte) (any, error) {
 
 func DecodeAny(data []byte, pos int) (any, int, error) {
 	if pos >= len(data) {
-		return nil, pos, fmt.Errorf("Unexpected end of data")
+		return nil, pos, fmt.Errorf("unexpected end of data")
 	}
 
 	switch {
@@ -34,20 +34,29 @@ func DecodeInt(data []byte, pos int) (int64, int, error) {
 	// move past the 'i'
 	pos += 1
 
+	if pos >= len(data) {
+		return 0, pos, fmt.Errorf("unexpected end of input")
+	}
+
 	var strBuilder strings.Builder
 	// check for leading '-' for negative values
 	if data[pos] == '-' {
 		strBuilder.WriteByte(data[pos])
 		pos += 1
 	}
-	// Loop through while there are numbers to add
-	for {
-		if data[pos] < '0' || data[pos] > '9' {
-			break
-		}
 
+	if pos >= len(data) {
+		return 0, pos, fmt.Errorf("unexpected end of input")
+	}
+
+	// Loop through while there are numbers to add
+	for pos < len(data) && data[pos] >= '0' && data[pos] <= '9' {
 		strBuilder.WriteByte(data[pos])
 		pos += 1
+	}
+
+	if pos >= len(data) {
+		return 0, pos, fmt.Errorf("unexpected end of input")
 	}
 
 	// check if the int terminated correctly, then move past the 'e'
@@ -68,13 +77,13 @@ func DecodeInt(data []byte, pos int) (int64, int, error) {
 func DecodeStr(data []byte, pos int) (string, int, error) {
 	// Obtain the length of the string
 	var strBuilder strings.Builder
-	for {
-		if data[pos] < '0' || data[pos] > '9' {
-			break
-		}
-
+	for pos < len(data) && data[pos] >= '0' && data[pos] <= '9' {
 		strBuilder.WriteByte(data[pos])
 		pos += 1
+	}
+
+	if pos >= len(data) {
+		return "", pos, fmt.Errorf("unexpected end of input")
 	}
 
 	if data[pos] != ':' {
@@ -87,8 +96,8 @@ func DecodeStr(data []byte, pos int) (string, int, error) {
 		return "", pos, err
 	}
 
-	if pos+int(length) > len(data) {
-		return "", pos, fmt.Errorf("unexpected end of data")
+	if length > int64(len(data)-pos) {
+		return "", pos, fmt.Errorf("string length exceeds that of input")
 	}
 
 	var newPos = int64(pos) + length
