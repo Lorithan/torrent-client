@@ -285,16 +285,18 @@ func startServingConcurrentPeerTest(t *testing.T, pieceCount int, available peer
 	}
 	copy(client.Bitfield, available)
 	client.Choked = false
+	// Complete setup before returning the client: cancellation may close its
+	// connection as soon as a worker starts, before the fake peer is scheduled.
+	if err := remote.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		local.Close()
+		remote.Close()
+		t.Fatal(err)
+	}
 	f := &concurrentPiecePeerTest{client: client, done: make(chan struct{})}
 	go func() {
 		defer close(f.done)
 		defer remote.Close()
-		f.err = func() error {
-			if err := remote.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
-				return err
-			}
-			return serve(remote)
-		}()
+		f.err = serve(remote)
 	}()
 	t.Cleanup(func() {
 		local.Close()
