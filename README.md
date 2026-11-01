@@ -127,3 +127,13 @@ failure display, and quit during a stalled transfer. Other tests cover terminal
 startup failures and joining transfer cleanup when the terminal program exits.
 See [VERIFYING.md](docs/VERIFYING.md) for the acceptance matrix and an opt-in local
 swarm that generates synthetic data in a directory you choose.
+
+## AI assistance
+
+The application implementation was written by Hunter Marshall. AI tools were
+used for consultation, architecture guidance, code review, and writing and running
+tests. AI also assisted with project documentation.
+
+## License
+
+This project is available under the [MIT License](LICENSE).
