@@ -1,11 +1,24 @@
 package tracker
 
 import (
+	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
+	"net/url"
+	"strconv"
 	"time"
+
+	"github.com/lorithan/torrent-client/internal/torrent"
 )
+
+type udpRetryPolicy struct {
+	initialTimeout time.Duration
+	maxAttempts    int
+	connectionTTL  time.Duration
+}
 
 const protocolID uint64 = 0x41727101980
 
@@ -69,17 +82,9 @@ func buildUDPAnnounceRequest(
 	transactionID uint32,
 	key uint32,
 ) ([]byte, error) {
-	if port == 0 {
-		return nil, fmt.Errorf("port cannot be 0")
-	}
-	if params.Downloaded < 0 {
-		return nil, fmt.Errorf("download cannot be negative")
-	}
-	if params.Uploaded < 0 {
-		return nil, fmt.Errorf("upload cannot be negative")
-	}
-	if params.Left < 0 {
-		return nil, fmt.Errorf("left cannot be negative")
+	err := validateAnnounceParams(port, params)
+	if err != nil {
+		return nil, err
 	}
 	event, err := udpEventCode(params.Event)
 	if err != nil {
@@ -211,4 +216,154 @@ func connectUDP(
 	}
 
 	return parseUDPConnectResponse(response, transactionID)
+}
+
+func dialUDPTracker(
+	ctx context.Context,
+	announceURL string,
+) (*net.UDPConn, error) {
+	parsed, err := url.Parse(announceURL)
+	if err != nil {
+		return nil, err
+	}
+
+	if parsed.Scheme != "udp" {
+		return nil, fmt.Errorf("expected udp url")
+	}
+	if parsed.Hostname() == "" {
+		return nil, fmt.Errorf("url must contain hostname")
+	}
+	port, err := strconv.ParseUint(parsed.Port(), 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse port of url: %w", err)
+	}
+	if port == 0 {
+		return nil, fmt.Errorf("port cannot be zero")
+	}
+
+	dialer := net.Dialer{
+		Timeout: 15 * time.Second,
+	}
+
+	conn, err := dialer.DialContext(ctx, "udp4", parsed.Host)
+	if err != nil {
+		return nil, err
+	}
+
+	udpConn, ok := conn.(*net.UDPConn)
+	if !ok {
+		conn.Close()
+		return nil, fmt.Errorf("udp connection could not be established")
+	}
+
+	return udpConn, nil
+}
+
+func (c *Client) announceUDP(
+	ctx context.Context,
+	tf *torrent.TorrentFile,
+	peerID [20]byte,
+	port uint16,
+	params AnnounceParams,
+) (*TrackerResponse, error) {
+	cancelled := ctx.Err()
+	if cancelled != nil {
+		return nil, cancelled
+	}
+
+	err := validateAnnounceParams(port, params)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := dialUDPTracker(ctx, tf.Announce)
+	if err != nil {
+		cancelled := ctx.Err()
+		if cancelled != nil {
+			return nil, cancelled
+		}
+		return nil, err
+	}
+	defer conn.Close()
+	stopCancellation := context.AfterFunc(ctx, func() {
+		conn.Close()
+	})
+	defer stopCancellation()
+
+	randBytes := make([]byte, 4)
+	rand.Read(randBytes)
+	connectTransID := binary.BigEndian.Uint32(randBytes)
+
+	rand.Read(randBytes)
+	announceTransID := binary.BigEndian.Uint32(randBytes)
+
+	var connectionID uint64
+	var connectionExpiration time.Time
+	timeout := c.udpPolicy.initialTimeout
+
+	var timeoutErr net.Error
+	attemps := 0
+	for attemps < c.udpPolicy.maxAttempts {
+		cancelled := ctx.Err()
+		if cancelled != nil {
+			return nil, cancelled
+		}
+
+		if !connectionExpiration.IsZero() && !time.Now().Before(connectionExpiration) {
+			rand.Read(randBytes)
+			connectTransID = binary.BigEndian.Uint32(randBytes)
+
+			rand.Read(randBytes)
+			announceTransID = binary.BigEndian.Uint32(randBytes)
+
+			connectionExpiration = time.Time{}
+		}
+
+		if connectionExpiration.IsZero() {
+			connectionID, err = connectUDP(conn, connectTransID, timeout)
+			if err != nil {
+				cancelled := ctx.Err()
+				if cancelled != nil {
+					return nil, cancelled
+				}
+				if err, is := errors.AsType[net.Error](err); is {
+					if err.Timeout() {
+						timeoutErr = err
+						timeout *= 2
+						attemps++
+						continue
+					}
+				}
+
+				return nil, err
+			}
+			connectionExpiration = time.Now().Add(c.udpPolicy.connectionTTL)
+		}
+
+		data, err := buildUDPAnnounceRequest(tf.InfoHash, peerID, port, params, connectionID, announceTransID, c.key)
+		if err != nil {
+			return nil, err
+		}
+
+		response, err := exchangeUDP(conn, data, announceTransID, timeout)
+		if err != nil {
+			cancelled := ctx.Err()
+			if cancelled != nil {
+				return nil, cancelled
+			}
+			if err, is := errors.AsType[net.Error](err); is {
+				if err.Timeout() {
+					timeoutErr = err
+					timeout *= 2
+					attemps++
+					continue
+				}
+			}
+
+			return nil, err
+		}
+		return parseUDPAnnounceResponse(response, announceTransID)
+	}
+
+	return nil, fmt.Errorf("connection attempts exhausted: %w", timeoutErr)
 }

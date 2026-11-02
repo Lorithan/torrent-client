@@ -975,7 +975,12 @@ func TestRunSeedsCompletedFileUntilCanceled(t *testing.T) {
 	if !errors.Is(runErr, context.Canceled) {
 		t.Errorf("run error=%v, want context.Canceled", runErr)
 	}
-	stopped := <-announces
+	var stopped url.Values
+	select {
+	case stopped = <-announces:
+	default:
+		t.Fatal("tracker did not receive stopped announce before shutdown completed")
+	}
 	if stopped.Get("event") != "stopped" || stopped.Get("uploaded") != "2" {
 		t.Errorf("stopped announce=%v", stopped)
 	}
@@ -997,6 +1002,10 @@ func TestRunParentCancellationStopsServices(t *testing.T) {
 		events <- event
 		if event == "started" {
 			cancel()
+			// Cancel before acknowledging started, making the initial-request
+			// cleanup path deterministic now that announces honor the context.
+			<-r.Context().Done()
+			return
 		}
 		_, _ = io.WriteString(w, "d8:intervali1800e5:peers0:e")
 	}))

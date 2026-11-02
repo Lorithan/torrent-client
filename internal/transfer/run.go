@@ -66,6 +66,7 @@ func (e *Engine) run(ctx context.Context) error {
 	httpClient := http.Client{
 		Timeout: 15 * time.Second,
 	}
+	client := tracker.NewClient(&httpClient)
 
 	params := tracker.AnnounceParams{
 		Downloaded: 0,
@@ -74,32 +75,7 @@ func (e *Engine) run(ctx context.Context) error {
 		Event:      tracker.AnnounceEventStarted,
 	}
 
-	e.setPhase(PhaseDiscovering)
-	response, err := tracker.Announce(torrentData, peerID, uint16(addr.Port), &httpClient, params)
-	if err != nil {
-		return err
-	}
-
-	peers := newPeerQueue()
-	peers.Add(response.Peers)
-
-	regularAnnounce := func() (*tracker.TrackerResponse, error) {
-		stats := session.Stats()
-		params := tracker.AnnounceParams{
-			Downloaded: stats.Downloaded,
-			Uploaded:   stats.Uploaded,
-			Left:       stats.Left,
-			Event:      tracker.AnnounceEventDefault,
-		}
-		response, err := tracker.Announce(torrentData, peerID, uint16(addr.Port), &httpClient, params)
-		if err != nil {
-			return response, err
-		}
-		peers.Add(response.Peers)
-		return response, err
-	}
-
-	defer func() {
+	announcedStopped := func() {
 		stats := session.Stats()
 		params := tracker.AnnounceParams{
 			Downloaded: stats.Downloaded,
@@ -107,11 +83,44 @@ func (e *Engine) run(ctx context.Context) error {
 			Left:       stats.Left,
 			Event:      tracker.AnnounceEventStopped,
 		}
-		_, err := tracker.Announce(torrentData, peerID, uint16(addr.Port), &httpClient, params)
+
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stopCancel()
+		_, err := client.Announce(stopCtx, torrentData, peerID, uint16(addr.Port), params)
 		if err != nil {
 			log.Printf("stopped announce error: %v", err)
 		}
-	}()
+	}
+
+	e.setPhase(PhaseDiscovering)
+	response, err := client.Announce(ctx, torrentData, peerID, uint16(addr.Port), params)
+	if err != nil {
+		cancelled := ctx.Err()
+		if cancelled != nil {
+			announcedStopped()
+		}
+		return err
+	}
+	defer announcedStopped()
+
+	peers := newPeerQueue()
+	peers.Add(response.Peers)
+
+	regularAnnounce := func(announceCtx context.Context) (*tracker.TrackerResponse, error) {
+		stats := session.Stats()
+		params := tracker.AnnounceParams{
+			Downloaded: stats.Downloaded,
+			Uploaded:   stats.Uploaded,
+			Left:       stats.Left,
+			Event:      tracker.AnnounceEventDefault,
+		}
+		response, err := client.Announce(announceCtx, torrentData, peerID, uint16(addr.Port), params)
+		if err != nil {
+			return response, err
+		}
+		peers.Add(response.Peers)
+		return response, err
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -163,7 +172,7 @@ func (e *Engine) run(ctx context.Context) error {
 			Event:      tracker.AnnounceEventCompleted,
 		}
 
-		_, err = tracker.Announce(torrentData, peerID, uint16(addr.Port), &httpClient, params)
+		_, err = client.Announce(ctx, torrentData, peerID, uint16(addr.Port), params)
 		if err != nil {
 			log.Printf("complete announce error: %s", err)
 		}

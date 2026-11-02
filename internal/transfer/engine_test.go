@@ -229,6 +229,149 @@ func TestEnginePublishesInitialAndFinalProgress(t *testing.T) {
 	}
 }
 
+func TestEngineDownloadsThroughUDPTracker(t *testing.T) {
+	firstHash, secondHash := sha1.Sum([]byte("abcd")), sha1.Sum([]byte("efgh"))
+	info := "d6:lengthi8e4:name8:file.bin12:piece lengthi4e6:pieces40:" + string(firstHash[:]) + string(secondHash[:]) + "e"
+	infoHash := sha1.Sum([]byte(info))
+	announcedID := make(chan [20]byte, 1)
+	addr, peerDone := startFallbackTestPeerWithVerifier(t, peer.Handshake{InfoHash: infoHash}, func(conn net.Conn) error {
+		for index, data := range []string{"abcd", "efgh"} {
+			if err := fallbackTestRequest(conn, uint32(index)); err != nil {
+				return err
+			}
+			if err := fallbackTestReply(conn, uint32(index), []byte(data)); err != nil {
+				return err
+			}
+			if err := fallbackTestHave(conn, uint32(index)); err != nil {
+				return err
+			}
+		}
+		return fallbackTestExpectClosed(conn)
+	}, func(wire [68]byte) error {
+		select {
+		case id := <-announcedID:
+			if !bytes.Equal(wire[28:48], infoHash[:]) || !bytes.Equal(wire[48:68], id[:]) {
+				return errors.New("peer handshake differs from UDP announce identity")
+			}
+		default:
+			return errors.New("peer connected before tracker announce")
+		}
+		return nil
+	})
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { server.Close() })
+	if err := server.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	announces := make(chan []byte, 3)
+	trackerDone := make(chan error, 1)
+	go func() {
+		defer close(trackerDone)
+		trackerDone <- func() error {
+			var packet [256]byte
+			for cycle := 0; cycle < 3; cycle++ {
+				n, sender, err := server.ReadFromUDP(packet[:])
+				if err != nil {
+					return err
+				}
+				if n != 16 || binary.BigEndian.Uint64(packet[:8]) != 0x41727101980 || binary.BigEndian.Uint32(packet[8:12]) != 0 {
+					return fmt.Errorf("invalid connect request: %x", packet[:n])
+				}
+				reply := append([]byte{0, 0, 0, 0}, packet[12:16]...)
+				reply = binary.BigEndian.AppendUint64(reply, uint64(cycle+1))
+				if _, err := server.WriteToUDP(reply, sender); err != nil {
+					return err
+				}
+				n, announceSender, err := server.ReadFromUDP(packet[:])
+				if err != nil {
+					return err
+				}
+				if n != 98 || announceSender.String() != sender.String() || binary.BigEndian.Uint32(packet[8:12]) != 1 || binary.BigEndian.Uint64(packet[:8]) != uint64(cycle+1) {
+					return fmt.Errorf("invalid announce request: %x", packet[:n])
+				}
+				announces <- append([]byte(nil), packet[:n]...)
+				if cycle == 0 {
+					announcedID <- [20]byte(packet[36:56])
+				}
+				reply = append([]byte{0, 0, 0, 1}, packet[12:16]...)
+				reply = append(reply, 0, 0, 7, 8, 0, 0, 0, 0, 0, 0, 0, 1, 127, 0, 0, 1)
+				reply = binary.BigEndian.AppendUint16(reply, uint16(addr.Port))
+				if _, err := server.WriteToUDP(reply, sender); err != nil {
+					return err
+				}
+			}
+			return nil
+		}()
+	}()
+	t.Cleanup(func() {
+		server.Close()
+		select {
+		case <-trackerDone:
+		case <-time.After(time.Second):
+			t.Error("UDP tracker fixture did not stop")
+		}
+	})
+	dir := t.TempDir()
+	input, output := filepath.Join(dir, "input.torrent"), filepath.Join(dir, "output.bin")
+	announceURL := "udp://" + server.LocalAddr().String() + "/announce"
+	meta := fmt.Appendf(nil, "d8:announce%d:%s4:info%se", len(announceURL), announceURL, info)
+	if err := os.WriteFile(input, meta, 0600); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := New(Config{TorrentPath: input, OutputPath: output, Workers: 1, PeerWaitTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := engine.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-trackerDone; err != nil {
+		t.Fatalf("UDP tracker: %v", err)
+	}
+	if len(announces) != 3 {
+		t.Fatalf("announce count = %d, want started/completed/stopped", len(announces))
+	}
+	var first []byte
+	for i, event := range []uint32{2, 1, 3} {
+		packet := <-announces
+		if i == 0 {
+			first = packet
+		}
+		if !bytes.Equal(packet[16:36], infoHash[:]) || !bytes.Equal(packet[36:56], first[36:56]) || !bytes.Equal(packet[88:92], first[88:92]) ||
+			!bytes.Equal(packet[96:98], first[96:98]) || binary.BigEndian.Uint16(packet[96:98]) == 0 {
+			t.Errorf("announce %d changed info hash, peer ID, session key, or listening port", i)
+		}
+		wantDownloaded, wantLeft := uint64(8), uint64(0)
+		if i == 0 {
+			wantDownloaded, wantLeft = 0, 8
+		}
+		if binary.BigEndian.Uint32(packet[80:84]) != event || binary.BigEndian.Uint64(packet[56:64]) != wantDownloaded ||
+			binary.BigEndian.Uint64(packet[64:72]) != wantLeft || binary.BigEndian.Uint64(packet[72:80]) != 0 {
+			t.Errorf("announce %d has incorrect lifecycle event or transfer counters: %x", i, packet)
+		}
+	}
+	if data, err := os.ReadFile(output); err != nil || string(data) != "abcdefgh" {
+		t.Errorf("output = %q, error = %v; want abcdefgh, nil", data, err)
+	}
+	status := engine.Status()
+	if status.Phase != PhaseStopped || status.ActivePeers != 0 || status.Progress.VerifiedBytes != 8 || status.Progress.Stats.Left != 0 {
+		t.Errorf("final engine status = %+v", status)
+	}
+	select {
+	case err := <-peerDone:
+		if err != nil {
+			t.Errorf("download peer: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("download peer did not close")
+	}
+}
+
 func TestEngineFinish(t *testing.T) {
 	failure := errors.New("output write failed")
 	for _, tc := range []struct {

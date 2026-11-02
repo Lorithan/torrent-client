@@ -1,6 +1,7 @@
 package tracker
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"io"
@@ -76,21 +77,9 @@ func buildAnnounceURL(tf *torrent.TorrentFile, peerID [20]byte, port uint16, par
 		return "", fmt.Errorf("expected scheme `http` or `https`, found `%s`", announceURL.Scheme)
 	}
 
-	if port == 0 {
-		return "", fmt.Errorf("Port cannot be `0`")
-	}
-
-	if params.Downloaded < 0 {
-		return "", fmt.Errorf("download cannot be negative")
-	}
-	if params.Uploaded < 0 {
-		return "", fmt.Errorf("uploaded cannout be negative")
-	}
-	if params.Left < 0 {
-		return "", fmt.Errorf("left cannot be negative")
-	}
-	if !params.Event.isValid() {
-		return "", fmt.Errorf("event %s not valid", params.Event)
+	err = validateAnnounceParams(port, params)
+	if err != nil {
+		return "", err
 	}
 
 	// Set query params
@@ -115,9 +104,17 @@ func buildAnnounceURL(tf *torrent.TorrentFile, peerID [20]byte, port uint16, par
 	return announceURL.String(), nil
 }
 
-func getAnnounceResponse(announceURL string, httpClient *http.Client) ([]byte, error) {
-	response, err := httpClient.Get(announceURL)
+func getAnnounceResponse(
+	ctx context.Context,
+	announceURL string,
+	httpClient *http.Client,
+) ([]byte, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, announceURL, nil)
+	if err != nil {
+		return nil, err
+	}
 
+	response, err := httpClient.Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -211,18 +208,26 @@ func parseTrackerResponse(data []byte) (*TrackerResponse, error) {
 	return &response, nil
 }
 
-func Announce(tf *torrent.TorrentFile, peerID [20]byte, port uint16, httpClient *http.Client, params AnnounceParams) (*TrackerResponse, error) {
-	announceURL, err := buildAnnounceURL(tf, peerID, port, params)
-
-	if err != nil {
-		return nil, err
+func validateAnnounceParams(
+	port uint16,
+	params AnnounceParams,
+) error {
+	if port == 0 {
+		return fmt.Errorf("port cannot be 0")
 	}
 
-	trackerResponse, err := getAnnounceResponse(announceURL, httpClient)
-
-	if err != nil {
-		return nil, err
+	if params.Downloaded < 0 {
+		return fmt.Errorf("download cannot be negative")
+	}
+	if params.Uploaded < 0 {
+		return fmt.Errorf("uploaded cannout be negative")
+	}
+	if params.Left < 0 {
+		return fmt.Errorf("left cannot be negative")
+	}
+	if !params.Event.isValid() {
+		return fmt.Errorf("event %s not valid", params.Event)
 	}
 
-	return parseTrackerResponse(trackerResponse)
+	return nil
 }

@@ -13,7 +13,7 @@ func runTrackerUpdates(
 	refresh <-chan struct{},
 	interval time.Duration,
 	minDelay time.Duration,
-	announce func() (*tracker.TrackerResponse, error),
+	announce func(context.Context) (*tracker.TrackerResponse, error),
 ) {
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
@@ -43,7 +43,7 @@ func runTrackerUpdates(
 			return
 		}
 
-		response, err := announce()
+		response, err := announce(ctx)
 		nextAllowed = time.Now().Add(minDelay)
 		if err != nil {
 			log.Printf("regular announce error: %v", err)
@@ -59,7 +59,7 @@ func startTrackerUpdates(
 	refresh <-chan struct{},
 	interval time.Duration,
 	minDelay time.Duration,
-	announce func() (*tracker.TrackerResponse, error),
+	announce func(context.Context) (*tracker.TrackerResponse, error),
 ) func() {
 	childCtx, cancelChild := context.WithCancel(ctx)
 	completion := make(chan struct{})

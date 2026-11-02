@@ -1,8 +1,9 @@
 # Project scope
 
-Status: agreed first-release scope. Deferred features remain future goals rather
-than first-release requirements. The implementation milestones are a working
-sequence and can be adjusted as the project develops.
+Status: the agreed v0.1.0 first-release scope, with the current development
+baseline and post-release additions recorded below. Deferred features remain
+future goals. The implementation milestones are a working sequence and can be
+adjusted as the project develops.
 
 ## Purpose and working agreement
 
@@ -35,7 +36,11 @@ The implementation currently provides:
 
 - Bencode decoding and single-file torrent parsing, including an info hash derived
   from the original encoded info dictionary bytes.
-- HTTP/HTTPS tracker announces and compact and dictionary IPv4 peer-list parsing.
+- HTTP/HTTPS and IPv4 UDP tracker announces. HTTP supports compact and dictionary
+  IPv4 peer lists; UDP uses compact IPv4 peers and requires an explicit tracker port.
+- A session-scoped tracker client retains the HTTP client and random UDP key.
+  UDP retries use three rounds with 15/30/60-second response timeouts, preserve
+  transaction IDs for retransmissions, and renew connection IDs after one minute.
 - Periodic announces with current session statistics and started, completed, and
   stopped lifecycle events. Requested rediscovery shares the same announce worker.
 - A synchronized peer queue and bounded discovery waits, with an announce
@@ -100,9 +105,27 @@ Uploads are currently served through incoming connections. Canceling a peer grou
 closes its connections and joins its workers before returning. Incoming server
 shutdown closes the listener and joins handlers and their readers. CLI Ctrl+C and
 SIGTERM cancel the session; discovery waits and tracker-worker cooldowns also
-support cancellation. Immediate cancellation of in-flight tracker HTTP calls and
-outbound peer preparation remains lifecycle work; those operations currently have
-bounded timeouts.
+support cancellation. HTTP requests and UDP tracker exchanges now honor context
+cancellation, including cancellation of the tracker-update worker independently
+of the session. The final stopped announce has a separate 15-second cleanup
+context, including when the initial started request is canceled before its reply.
+Outbound peer preparation still uses bounded timeouts rather than immediate
+context cancellation.
+
+## Post-release addition: UDP trackers
+
+UDP tracker support is implemented in the development checkout after v0.1.0;
+the original release's discovery scope remains HTTP/HTTPS. The supported UDP
+subset is IPv4 connect/announce exchanges against the primary announce URL.
+UDP URL query parameters are not encoded into tracker packets. Announce tiers,
+scraping, and IPv6 remain deferred.
+
+Local tests cover exact packet formats, malformed and unrelated replies, tracker
+errors, dropped-packet retries, retained transaction IDs, connection-ID expiry,
+retry exhaustion, cancellation, and socket cleanup. An engine integration test
+downloads a complete file through a UDP tracker and verifies started/completed/
+stopped events, counters, session identity, and the listening port. The ordinary
+suite and race detector cover these scenarios without a public tracker.
 
 ## First-release features and acceptance criteria
 
@@ -123,8 +146,8 @@ lifecycle events, and supply a replacement peer after earlier peers become
 unusable. Invalid or unsupported inputs fail with useful errors.
 
 The initial discovery boundary is the torrent's primary announce URL.
-UDP trackers and announce-list tiers are deferred; this deliberately limits which
-public torrents the first release can use.
+UDP trackers were deferred from v0.1.0 and are now implemented in the development
+checkout. Announce-list tiers remain deferred.
 
 ### 2. Download progress and peer recovery
 
@@ -232,7 +255,7 @@ excluded. Revisit them after the first-release acceptance criteria are met:
 - Multi-file torrents and several torrents running at once.
 - Restart/resume, persisted sessions, and seed-only startup from existing files.
 - Pause/resume controls; stop/quit are sufficient for the first UI.
-- UDP trackers, announce-list tiers, magnet links, DHT, and peer exchange.
+- Announce-list tiers, tracker scraping, magnet links, DHT, and peer exchange.
 - BitTorrent v2/hybrid torrents, uTP transport, and protocol encryption.
 - IPv6 peer discovery/connections and automatic NAT port mapping.
 - Request pipelining, rarest-first selection, endgame mode, and advanced peer
@@ -240,8 +263,8 @@ excluded. Revisit them after the first-release acceptance criteria are met:
 - Bandwidth controls, file selection, streaming, watch folders, and a remote API.
 - Overwrite prompts/flags, graphical file pickers, and UI customization.
 
-Local tracker/peer fixtures can verify a small complete transfer without waiting
-for UDP support or relying on a particular public swarm.
+Local HTTP/UDP tracker and peer fixtures verify small complete transfers without
+relying on a particular public swarm.
 
 ## Implementation milestones
 
@@ -289,6 +312,7 @@ Session progress, tracker lifecycle/rediscovery, concurrent peer scheduling,
 incoming uploads, seeding, shared status reporting, and the TUI are implemented.
 All six agreed implementation milestones are complete. Release verification and
 user documentation include reproducible local scenarios, exact output hashes,
-and explicit platform/protocol limits. Follow-up features remain deferred until
-they are deliberately selected; publishing a version tag or GitHub release is a
+and explicit platform/protocol limits. v0.1.0 has been published; the UDP addition
+is subsequent development work. Other follow-up features remain deferred until
+deliberately selected. Publishing another version tag or GitHub release is a
 separate step.

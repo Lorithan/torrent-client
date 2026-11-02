@@ -2,9 +2,11 @@ package tracker
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -13,8 +15,19 @@ import (
 )
 
 func TestAnnounce(t *testing.T) {
+	for _, scheme := range []string{"http", "https"} {
+		t.Run(scheme, func(t *testing.T) {
+			testHTTPAnnounce(t, scheme)
+		})
+	}
+}
+
+func testHTTPAnnounce(t *testing.T, scheme string) {
+	t.Helper()
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "announce request")
 	tf := &torrent.TorrentFile{
-		Announce: "https://tracker.example/private/announce?passkey=secret",
+		Announce: scheme + "://tracker.example/private/announce?passkey=secret",
 		InfoHash: [20]byte{0, 255, 128, ' ', '+', '&', '%'},
 		Length:   10485760,
 	}
@@ -25,7 +38,10 @@ func TestAnnounce(t *testing.T) {
 	calls := 0
 	client := &http.Client{Transport: announceTestTransport(func(req *http.Request) (*http.Response, error) {
 		calls++
-		if req.Method != http.MethodGet || req.URL.Host != "tracker.example" || req.URL.Path != "/private/announce" {
+		if req.Context().Value(contextKey{}) != "announce request" {
+			t.Error("session client did not preserve the caller's request context")
+		}
+		if req.Method != http.MethodGet || req.URL.Scheme != scheme || req.URL.Host != "tracker.example" || req.URL.Path != "/private/announce" {
 			t.Errorf("unexpected request: %s %s", req.Method, req.URL)
 		}
 		query := req.URL.Query()
@@ -41,7 +57,8 @@ func TestAnnounce(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: body, Header: make(http.Header)}, nil
 	})}
 
-	got, err := Announce(tf, peerID, 6881, client, AnnounceParams{Uploaded: 321, Downloaded: 12345678, Left: 456, Event: AnnounceEventStopped})
+	params := AnnounceParams{Uploaded: 321, Downloaded: 12345678, Left: 456, Event: AnnounceEventStopped}
+	got, err := NewClient(client).Announce(ctx, tf, peerID, 6881, params)
 	if err != nil {
 		t.Fatalf("Announce() error: %v", err)
 	}
@@ -65,6 +82,51 @@ func TestAnnounce(t *testing.T) {
 	}
 }
 
+func TestClientAnnounceRejectsInvalidInput(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		url      string
+		port     uint16
+		params   AnnounceParams
+		canceled bool
+	}{
+		{name: "unsupported scheme", url: "ftp://tracker.example/announce", port: 6881},
+		{name: "missing scheme", url: "tracker.example/announce", port: 6881},
+		{name: "malformed URL", url: "https://tracker.example/%zz", port: 6881},
+		{name: "zero HTTP port", url: "https://tracker.example/announce"},
+		{name: "zero UDP port", url: "udp://127.0.0.1:6969/announce"},
+		{name: "negative uploaded", url: "https://tracker.example/announce", port: 6881, params: AnnounceParams{Uploaded: -1}},
+		{name: "negative downloaded", url: "udp://127.0.0.1:6969/announce", port: 6881, params: AnnounceParams{Downloaded: -1}},
+		{name: "negative left", url: "https://tracker.example/announce", port: 6881, params: AnnounceParams{Left: -1}},
+		{name: "invalid event", url: "udp://127.0.0.1:6969/announce", port: 6881, params: AnnounceParams{Event: "unknown"}},
+		{name: "canceled HTTP", url: "https://tracker.example/announce", port: 6881, canceled: true},
+		{name: "canceled UDP", url: "udp://127.0.0.1:6969/announce", port: 6881, canceled: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			httpClient := &http.Client{Transport: announceTestTransport(func(*http.Request) (*http.Response, error) {
+				calls++
+				return nil, errors.New("unexpected HTTP request")
+			})}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if tt.canceled {
+				cancel()
+			}
+			got, err := NewClient(httpClient).Announce(ctx, &torrent.TorrentFile{Announce: tt.url}, [20]byte{}, tt.port, tt.params)
+			if got != nil || err == nil {
+				t.Fatalf("response = %+v, error = %v; want nil response and an error", got, err)
+			}
+			if tt.canceled && !errors.Is(err, context.Canceled) {
+				t.Errorf("error = %v, want context.Canceled", err)
+			}
+			if calls != 0 {
+				t.Errorf("made %d HTTP requests for invalid input", calls)
+			}
+		})
+	}
+}
+
 func TestAnnounceErrors(t *testing.T) {
 	connectionErr := errors.New("connection failed")
 	tests := []struct {
@@ -76,7 +138,7 @@ func TestAnnounceErrors(t *testing.T) {
 		wantCalls  int
 		message    string
 	}{
-		{name: "URL failure stops before request", announce: "udp://tracker.example/announce", wantCalls: 0},
+		{name: "unsupported scheme stops before request", announce: "ftp://tracker.example/announce", wantCalls: 0},
 		{name: "request failure", announce: "https://tracker.example/announce", requestErr: connectionErr, wantCalls: 1},
 		{name: "HTTP failure", announce: "https://tracker.example/announce", status: 503, wantCalls: 1},
 		{name: "invalid bencode", announce: "https://tracker.example/announce", status: 200, body: "x", wantCalls: 1},
@@ -97,7 +159,7 @@ func TestAnnounceErrors(t *testing.T) {
 					Header:     make(http.Header),
 				}, nil
 			})}
-			got, err := Announce(&torrent.TorrentFile{Announce: tt.announce, Length: 1024}, [20]byte{}, 6881, client, AnnounceParams{Left: 1024, Event: AnnounceEventStarted})
+			got, err := NewClient(client).Announce(context.Background(), &torrent.TorrentFile{Announce: tt.announce, Length: 1024}, [20]byte{}, 6881, AnnounceParams{Left: 1024, Event: AnnounceEventStarted})
 			if err == nil || got != nil {
 				t.Fatalf("got (%v, %v), want nil response and error", got, err)
 			}
@@ -131,7 +193,7 @@ func TestAnnounceRejectsInvalidParamsBeforeRequest(t *testing.T) {
 				return nil, errors.New("unexpected HTTP request")
 			})}
 			tf := &torrent.TorrentFile{Announce: "https://tracker.example/announce", Length: 1000}
-			got, err := Announce(tf, [20]byte{}, 6881, client, tt.params)
+			got, err := NewClient(client).Announce(context.Background(), tf, [20]byte{}, 6881, tt.params)
 			if got != nil || err == nil {
 				t.Errorf("got (%v, %v), want nil response and validation error", got, err)
 			}
@@ -200,7 +262,7 @@ func TestGetAnnounceResponse(t *testing.T) {
 				}, nil
 			})}
 
-			got, err := getAnnounceResponse("https://tracker.example/announce?compact=1", client)
+			got, err := getAnnounceResponse(context.Background(), "https://tracker.example/announce?compact=1", client)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -225,11 +287,79 @@ func TestGetAnnounceResponseRequestError(t *testing.T) {
 	client := &http.Client{Transport: announceTestTransport(func(*http.Request) (*http.Response, error) {
 		return nil, wantErr
 	})}
-	got, err := getAnnounceResponse("https://tracker.example/announce", client)
+	got, err := getAnnounceResponse(context.Background(), "https://tracker.example/announce", client)
 	if !errors.Is(err, wantErr) {
 		t.Errorf("error = %v, want underlying request error %v", err, wantErr)
 	}
 	if got != nil {
 		t.Error("expected nil bytes on request failure")
+	}
+}
+
+func TestGetAnnounceResponseCancellation(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		streamBody bool
+		useClient  bool
+	}{
+		{name: "helper waiting for headers"},
+		{name: "helper unfinished response body", streamBody: true},
+		{name: "client waiting for headers", useClient: true},
+		{name: "client unfinished response body", streamBody: true, useClient: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ready := make(chan struct{})
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tt.streamBody {
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte("d"))
+					w.(http.Flusher).Flush()
+				}
+				close(ready)
+				select {
+				case <-r.Context().Done():
+				case <-release:
+				}
+			}))
+			t.Cleanup(server.Close)
+			t.Cleanup(func() { close(release) })
+			ctx, cancel := context.WithCancel(context.Background())
+			client := server.Client()
+			client.Timeout = 5 * time.Second // Backstop; cancellation must win first.
+			done := make(chan struct{})
+			var responseErr error
+			go func() {
+				defer close(done)
+				if tt.useClient {
+					_, responseErr = NewClient(client).Announce(ctx, &torrent.TorrentFile{Announce: server.URL}, [20]byte{}, 6881, AnnounceParams{})
+				} else {
+					_, responseErr = getAnnounceResponse(ctx, server.URL, client)
+				}
+			}()
+			t.Cleanup(func() {
+				cancel()
+				server.CloseClientConnections()
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Error("HTTP helper retained a running request")
+				}
+			})
+			select {
+			case <-ready:
+			case <-time.After(2 * time.Second):
+				t.Fatal("request never reached the local tracker")
+			}
+			cancel()
+			select {
+			case <-done:
+				if !errors.Is(responseErr, context.Canceled) {
+					t.Errorf("error = %v, want context.Canceled", responseErr)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("cancellation did not interrupt the HTTP request")
+			}
+		})
 	}
 }

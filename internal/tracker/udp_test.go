@@ -2,14 +2,19 @@ package tracker
 
 import (
 	"bytes"
+	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
 	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lorithan/torrent-client/internal/torrent"
 )
 
 func TestBuildUDPConnectRequest(t *testing.T) {
@@ -552,6 +557,239 @@ func TestConnectUDP(t *testing.T) {
 				t.Errorf("connection ID = %x, error = %v; want %x, nil", got, err, tt.wantID)
 			}
 			if err := <-done; err != nil {
+				t.Errorf("fake UDP tracker: %v", err)
+			}
+		})
+	}
+}
+
+func TestDialUDPTracker(t *testing.T) {
+	_, server := udpResponseTestPair(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := dialUDPTracker(ctx, "udp://"+server.LocalAddr().String()+"/announce")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if conn.RemoteAddr().String() != server.LocalAddr().String() {
+		t.Errorf("remote address = %s, want %s", conn.RemoteAddr(), server.LocalAddr())
+	}
+	if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("probe")); err != nil {
+		t.Fatal(err)
+	}
+	var packet [64]byte
+	n, sender, err := server.ReadFromUDP(packet[:])
+	if err != nil || string(packet[:n]) != "probe" {
+		t.Fatalf("tracker received %q, error = %v; want probe, nil", packet[:n], err)
+	}
+	if _, err := server.WriteToUDP([]byte("reply"), sender); err != nil {
+		t.Fatal(err)
+	}
+	n, err = conn.Read(packet[:])
+	if err != nil || string(packet[:n]) != "reply" {
+		t.Fatalf("client received %q, error = %v; want reply, nil", packet[:n], err)
+	}
+}
+
+func TestDialUDPTrackerRejectsInvalidURL(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		url  string
+	}{
+		{"malformed escape", "udp://127.0.0.1:6969/%zz"},
+		{"wrong scheme", "http://127.0.0.1:6969/announce"},
+		{"missing hostname", "udp://:6969/announce"},
+		{"missing port", "udp://127.0.0.1/announce"},
+		{"empty port", "udp://127.0.0.1:/announce"},
+		{"nonnumeric port", "udp://127.0.0.1:abc/announce"},
+		{"negative port", "udp://127.0.0.1:-1/announce"},
+		{"port too large", "udp://127.0.0.1:65536/announce"},
+		{"zero port", "udp://127.0.0.1:0/announce"},
+		{"IPv6 endpoint", "udp://[::1]:6969/announce"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			conn, err := dialUDPTracker(ctx, tt.url)
+			if conn != nil {
+				conn.Close()
+			}
+			if err == nil {
+				t.Fatal("accepted invalid or unsupported tracker URL")
+			}
+		})
+	}
+}
+
+func TestDialUDPTrackerCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	conn, err := dialUDPTracker(ctx, "udp://127.0.0.1:6969/announce")
+	if conn != nil {
+		conn.Close()
+		t.Error("returned a socket after cancellation")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+}
+
+func TestClientAnnounceUDP(t *testing.T) {
+	for _, mode := range []string{"success", "connect rejection", "announce rejection", "cancel connect", "cancel announce"} {
+		t.Run(mode, func(t *testing.T) {
+			_, server := udpResponseTestPair(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			t.Cleanup(cancel)
+			client := NewClient(http.DefaultClient)
+			tf := &torrent.TorrentFile{
+				Announce: "udp://" + server.LocalAddr().String() + "/announce",
+				InfoHash: [20]byte{0, 0xff, 0x80, 1, 2, 3},
+			}
+			peerID := [20]byte{'-', 'C', 'T', '0', '0', '0', '1', '-', 0xff, 0}
+			params := AnnounceParams{Uploaded: 321, Downloaded: 12345678, Left: 456, Event: AnnounceEventStarted}
+			attempts := 1
+			if mode == "success" {
+				attempts = 2 // Both announces must use this client's original key.
+			}
+			addresses := make(chan *net.UDPAddr, attempts)
+			ready := make(chan struct{}, 1)
+			trackerDone := make(chan error, 1)
+			go func() {
+				defer close(trackerDone)
+				trackerDone <- func() error {
+					var packet [256]byte
+					for range attempts {
+						n, addr, err := server.ReadFromUDP(packet[:])
+						if err != nil {
+							return err
+						}
+						addresses <- addr
+						if n != 16 || hex.EncodeToString(packet[:12]) != "000004172710198000000000" {
+							return fmt.Errorf("invalid connect request: %x", packet[:n])
+						}
+						connectTransaction := append([]byte(nil), packet[12:16]...)
+						if mode == "cancel connect" {
+							ready <- struct{}{}
+							<-ctx.Done()
+							return nil
+						}
+						reply := append([]byte{0, 0, 0, 0}, connectTransaction...)
+						if mode == "connect rejection" {
+							reply[3] = 3
+							reply = append(reply, "denied"...)
+						} else {
+							reply = append(reply, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88)
+						}
+						if _, err := server.WriteToUDP(reply, addr); err != nil {
+							return err
+						}
+						if mode == "connect rejection" {
+							return nil
+						}
+						n, announceAddr, err := server.ReadFromUDP(packet[:])
+						if err != nil {
+							return err
+						}
+						if n != 98 || announceAddr.String() != addr.String() {
+							return fmt.Errorf("announce length/address = %d/%s, want 98/%s", n, announceAddr, addr)
+						}
+						if binary.BigEndian.Uint64(packet[:8]) != 0x1122334455667788 || binary.BigEndian.Uint32(packet[8:12]) != 1 ||
+							!bytes.Equal(packet[16:36], tf.InfoHash[:]) || !bytes.Equal(packet[36:56], peerID[:]) ||
+							binary.BigEndian.Uint64(packet[56:64]) != uint64(params.Downloaded) || binary.BigEndian.Uint64(packet[64:72]) != uint64(params.Left) ||
+							binary.BigEndian.Uint64(packet[72:80]) != uint64(params.Uploaded) || binary.BigEndian.Uint32(packet[80:84]) != 2 ||
+							binary.BigEndian.Uint32(packet[88:92]) != client.key || binary.BigEndian.Uint16(packet[96:98]) != 6881 {
+							return fmt.Errorf("announce did not preserve connection ID, torrent identity, counters, event, session key, or listening port: %x", packet[:n])
+						}
+						if mode == "cancel announce" {
+							ready <- struct{}{}
+							<-ctx.Done()
+							return nil
+						}
+						reply = append([]byte{0, 0, 0, 1}, packet[12:16]...)
+						if mode == "announce rejection" {
+							reply[3] = 3
+							reply = append(reply, "denied"...)
+						} else {
+							reply = append(reply, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1, 0x1a, 0xe1)
+						}
+						if _, err := server.WriteToUDP(reply, addr); err != nil {
+							return err
+						}
+					}
+					return nil
+				}()
+			}()
+			t.Cleanup(func() {
+				cancel()
+				server.Close()
+				select {
+				case <-trackerDone:
+				case <-time.After(time.Second):
+					t.Error("fake UDP tracker did not stop")
+				}
+			})
+			for range attempts {
+				done := make(chan struct{})
+				var response *TrackerResponse
+				var responseErr error
+				go func() {
+					defer close(done)
+					response, responseErr = client.Announce(ctx, tf, peerID, 6881, params)
+				}()
+				t.Cleanup(func() {
+					cancel()
+					select {
+					case <-done:
+					case <-time.After(time.Second):
+						t.Error("UDP announce retained a running operation")
+					}
+				})
+				if strings.HasPrefix(mode, "cancel") {
+					select {
+					case <-ready:
+						cancel()
+					case <-time.After(2 * time.Second):
+						t.Fatal("announce never reached the cancellation stage")
+					}
+				}
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("UDP announce did not finish promptly")
+				}
+				switch {
+				case strings.HasPrefix(mode, "cancel"):
+					if !errors.Is(responseErr, context.Canceled) {
+						t.Errorf("error = %v, want context.Canceled", responseErr)
+					}
+				case strings.HasSuffix(mode, "rejection"):
+					if responseErr == nil || !strings.Contains(responseErr.Error(), "denied") {
+						t.Errorf("error = %v, want tracker rejection", responseErr)
+					}
+				default:
+					if responseErr != nil || response == nil || response.Interval != 30*time.Second || len(response.Peers) != 1 || response.Peers[0].String() != "127.0.0.1:6881" {
+						t.Errorf("response = %+v, error = %v; want interval 30s and peer 127.0.0.1:6881", response, responseErr)
+					}
+				}
+				select {
+				case addr := <-addresses:
+					// Rebinding the operation's local port verifies synchronous socket
+					// cleanup on return, including paths where the context is live.
+					probe, err := net.ListenUDP("udp4", addr)
+					if err != nil {
+						t.Errorf("announce socket is still bound after return: %v", err)
+					} else {
+						probe.Close()
+					}
+				default:
+					t.Error("tracker did not observe a connect request")
+				}
+			}
+			if err := <-trackerDone; err != nil {
 				t.Errorf("fake UDP tracker: %v", err)
 			}
 		})

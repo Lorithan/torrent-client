@@ -3,7 +3,7 @@
 A Go BitTorrent client built as a portfolio and learning project.
 
 The CLI and terminal UI share a transfer engine that discovers peers through an
-HTTP/HTTPS tracker and downloads from bounded groups of peers concurrently. It
+HTTP/HTTPS or UDP tracker and downloads from bounded groups of peers concurrently. It
 verifies piece SHA-1 hashes before writing,
 reassigns failed work, and preserves verified progress across peer groups. Tracker
 updates report session statistics and refresh discovery when peers are exhausted.
@@ -12,6 +12,9 @@ as downloading progresses. Completed downloads continue seeding until stopped.
 The Bubble Tea/Lip Gloss TUI displays live progress, rates, peers, phases, and
 failures, with keyboard cancellation and a compact layout for small terminals.
 
+UDP tracker support was added after v0.1.0. Build from the current checkout to use
+it; the v0.1.0 release binary supports HTTP/HTTPS trackers.
+
 See [Project scope](docs/SCOPE.md) for the current baseline, confirmed release
 decisions, agreed feature boundaries, acceptance criteria, and milestone order.
 
@@ -19,7 +22,7 @@ decisions, agreed feature boundaries, acceptance criteria, and milestone order.
 
 Use Go 1.26.4 or later. Release checks currently target Linux amd64; other
 platforms are not verified. TUI mode requires an interactive terminal. Tests need
-permission to open loopback TCP sockets. Initial dependency downloads require
+permission to open loopback TCP and UDP sockets. Initial dependency downloads require
 network access; the controlled swarm scenarios themselves run locally.
 
 ```sh
@@ -92,13 +95,24 @@ a compact view preserves stop/quit controls and asks for a larger terminal. Fina
 failure details remain visible in the full view and are reported after the TUI is
 dismissed. Recoverable peer diagnostics remain in the log.
 
-Single-file torrents with HTTP/HTTPS trackers and compact or dictionary IPv4 peer
-lists are supported. Existing output files are not overwritten. Verified progress
+Single-file torrents with HTTP/HTTPS or IPv4 UDP trackers are supported. HTTP
+responses may contain compact or dictionary IPv4 peer lists; UDP responses use
+compact IPv4 peers. UDP tracker URLs must include an explicit nonzero port.
+Existing output files are not overwritten. Verified progress
 survives peer failures within the running session; restarting the application does
 not resume partial output. The listening port accepts incoming TCP peers; public
 inbound reachability may require manual router configuration. Uploads are currently
-served through incoming connections. In-flight tracker HTTP requests and outbound
-peer preparation use bounded timeouts rather than immediate context cancellation.
+served through incoming connections. Tracker requests honor context cancellation;
+outbound peer preparation still uses bounded timeouts rather than immediate
+context cancellation. The final stopped announce uses a separate cleanup context
+with a 15-second limit, including when cancellation interrupts the initial announce.
+
+UDP announces use three retry rounds, with response timeouts of 15, 30, and 60
+seconds. A round can include a connect exchange followed by an announce exchange;
+only network timeouts consume another round. Transaction IDs are retained for
+retransmissions, connection IDs are renewed after their one-minute lifetime, and
+the UDP key is retained for the session. UDP URL query parameters are not encoded
+into tracker packets.
 
 Partial output is retained after a stop or failure. There is no restart/resume:
 another invocation refuses that existing path, even if the file is incomplete.
@@ -106,10 +120,10 @@ Choose a new output path or manage the partial file yourself. Parent output
 directories must already exist. Keep downloaded data outside the checkout;
 personal torrent files, logs, and ISO downloads are excluded from commits.
 
-UDP trackers, magnet links, DHT/PEX, announce tiers, multi-file and v2/hybrid
+Magnet links, DHT/PEX, announce tiers, multi-file and v2/hybrid
 torrents, IPv6 peers, automatic port mapping, pause/resume, and request pipelining
-are deferred. The supported discovery path is HTTP/HTTPS with compact or
-dictionary IPv4 peers. Detailed release limits and scenario commands are in
+are deferred. Discovery uses the torrent's primary HTTP/HTTPS or UDP announce URL.
+Detailed release limits and scenario commands are in
 [VERIFYING.md](docs/VERIFYING.md) and [SCOPE.md](docs/SCOPE.md).
 
 ## Tests
@@ -134,7 +148,7 @@ GitHub Actions builds, vets, and race-tests the project on pushes and pull
 requests, then runs each fuzz target for ten seconds. These short runs supplement
 the regression tests; they do not prove that all malformed inputs are handled.
 
-Some tests open loopback TCP connections for local fake trackers and peers.
+Some tests open loopback TCP and UDP sockets for local fake trackers and peers.
 They do not require public trackers or a real swarm.
 Real-engine TUI tests cover live partial progress, resizing, seeding uploads,
 failure display, and quit during a stalled transfer. Other tests cover terminal

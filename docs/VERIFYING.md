@@ -1,13 +1,14 @@
 # Release verification
 
-This document describes evidence for the supported first-release subset. It does
-not add deferred features or publish a GitHub release/tag. Tests generate small
-synthetic torrents and data; no personal torrent files belong in the repository.
+This document describes evidence for the first-release baseline and subsequent
+development additions. UDP support described here was added after v0.1.0, whose
+binary supports HTTP/HTTPS trackers. Tests generate small synthetic torrents and
+data; no personal torrent files belong in the repository.
 
 ## Environment and complete checks
 
 The development/release-check environment is Go 1.26.4 on Linux amd64. Use an
-interactive terminal for manual TUI checks and allow loopback TCP for local fake
+interactive terminal for manual TUI checks and allow loopback TCP/UDP for local fake
 trackers and peers. Download Go modules before attempting offline verification.
 
 From the repository root:
@@ -42,6 +43,9 @@ instantaneous. These checks are meant for the documented development platform.
 | TUI over the real engine | `tui/TestTUIRealEngineTransferResizeSeedAndQuit` and `tui/TestTUIRealEngineFailureRemainsVisibleUntilQuit` |
 | Cancellation and cleanup | `download/TestSessionDownloadFromPeersCancellationJoinsStalledWorkers`, transfer incoming tests, TUI program startup/termination tests |
 | Availability broadcasts and reader shutdown | Download session notification tests and `download/TestSessionServePeerBroadcastsAvailabilityAndServesNewPieces` |
+| UDP discovery and engine lifecycle | `transfer/TestEngineDownloadsThroughUDPTracker` checks complete output, started/completed/stopped events, counters, and consistent session identity and listening port |
+| UDP retransmission and expiry | `tracker/TestClientAnnounceUDPRetries` uses short policy timeouts to check dropped replies, retained transactions, connection reuse/renewal, and exhaustion |
+| Tracker cancellation and cleanup | `tracker/TestClientAnnounceUDP`, `tracker/TestGetAnnounceResponseCancellation`, `transfer/TestStopTrackerUpdatesCancelsInFlightAnnounce`, and `cmd/TestRunParentCancellationStopsServices` |
 | Diagnostics separated from the TUI | CLI logging tests, TUI lifecycle tests, and the manual terminal procedure below |
 
 Focused checks, if needed after a change:
@@ -50,6 +54,8 @@ Focused checks, if needed after a change:
 go test -race ./cmd -run '^TestRunWorkerFlagEnablesOverlappingPeerRequests$' -count=1
 go test -race ./internal/download -run '^TestSessionDownloadFromPeers(RecoversDuringOtherTransfer|StorageFailureStopsWholeBatch|CancellationJoinsStalledWorkers)$' -count=1
 go test -race ./internal/tui -run '^TestTUIRealEngine' -count=1
+go test -race ./internal/tracker -run '^TestClientAnnounceUDP' -count=1 -timeout=30s
+go test -race ./internal/transfer -run '^TestEngineDownloadsThroughUDPTracker$' -count=1 -timeout=30s
 ```
 
 ## Reproducible local CLI/TUI and seed check
@@ -141,11 +147,14 @@ verification. Public swarms supplement these deterministic fixtures.
 Supported: one BitTorrent v1 single-file torrent; HTTP/HTTPS tracker discovery;
 compact/dictionary IPv4 peer lists; bounded concurrent TCP downloads; verified
 disk-backed uploads through incoming connections; in-process seeding; CLI/TUI.
+The current checkout additionally supports IPv4 UDP tracker connect/announce
+exchanges against explicit nonzero tracker ports. Local automated tests verify
+this path; the manual fixture above continues to use an HTTP tracker.
 
 Important limits:
 
 - No restart/resume, seed-only restart, pause/resume, or overwrite support.
-- No UDP trackers, magnet links, DHT/PEX, announce tiers, multi-file/v2/hybrid
+- No magnet links, DHT/PEX, announce tiers, tracker scraping, multi-file/v2/hybrid
   torrents, IPv6 discovery, uTP/encryption, or automatic router port mapping.
 - Download peers are prepared sequentially into bounded batches. New tracker
   peers join later batches; requests are not pipelined and advanced selection,
@@ -153,9 +162,13 @@ Important limits:
 - Incoming connections are limited to eight including handshakes. Active-peer
   status counts successfully prepared outgoing and incoming connections.
 - Active transfer/incoming cancellation closes sockets and joins workers.
-  In-flight tracker HTTP requests and outbound peer preparation still have
-  bounded timeouts rather than immediate cancellation. Shutdown may wait for
-  those timeouts and the final bounded stopped announce.
+  Tracker HTTP/UDP calls honor cancellation; stopping the update worker cancels
+  its in-flight announce independently of the parent session. Outbound peer
+  preparation still uses bounded timeouts. Shutdown may wait for that work and
+  the final stopped announce, which has its own 15-second cleanup context.
+- UDP uses three retry rounds with 15/30/60-second response timeouts. A round may
+  contain connect and announce exchanges. Only timeouts are retried; connection
+  IDs expire after one minute. UDP URL query parameters are not encoded.
 - Output is an explicit user path and existing files are refused. Failed/stopped
   attempts keep partial output; parent directories must already exist.
 - Linux amd64 is verified. Installation instructions and fixture commands use

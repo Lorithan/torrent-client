@@ -10,17 +10,17 @@ import (
 	"github.com/lorithan/torrent-client/internal/tracker"
 )
 
-func startTrackerUpdatesTest(t *testing.T, interval time.Duration, announce func() (*tracker.TrackerResponse, error)) (context.CancelFunc, <-chan struct{}) {
+func startTrackerUpdatesTest(t *testing.T, interval time.Duration, announce func(context.Context) (*tracker.TrackerResponse, error)) (context.CancelFunc, <-chan struct{}) {
 	t.Helper()
 	return startTrackerUpdatesWithRefreshTest(t, nil, interval, announce)
 }
 
-func startTrackerUpdatesWithRefreshTest(t *testing.T, refresh <-chan struct{}, interval time.Duration, announce func() (*tracker.TrackerResponse, error)) (context.CancelFunc, <-chan struct{}) {
+func startTrackerUpdatesWithRefreshTest(t *testing.T, refresh <-chan struct{}, interval time.Duration, announce func(context.Context) (*tracker.TrackerResponse, error)) (context.CancelFunc, <-chan struct{}) {
 	t.Helper()
 	return startTrackerUpdatesWithDelayTest(t, refresh, interval, 0, announce)
 }
 
-func startTrackerUpdatesWithDelayTest(t *testing.T, refresh <-chan struct{}, interval, minDelay time.Duration, announce func() (*tracker.TrackerResponse, error)) (context.CancelFunc, <-chan struct{}) {
+func startTrackerUpdatesWithDelayTest(t *testing.T, refresh <-chan struct{}, interval, minDelay time.Duration, announce func(context.Context) (*tracker.TrackerResponse, error)) (context.CancelFunc, <-chan struct{}) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -42,7 +42,7 @@ func TestTrackerUpdatesRefreshBeforeInterval(t *testing.T) {
 			refresh := make(chan struct{}, 1)
 			calls := make(chan int, 2)
 			attempt := 0
-			cancel, done := startTrackerUpdatesWithRefreshTest(t, refresh, time.Hour, func() (*tracker.TrackerResponse, error) {
+			cancel, done := startTrackerUpdatesWithRefreshTest(t, refresh, time.Hour, func(context.Context) (*tracker.TrackerResponse, error) {
 				attempt++
 				calls <- attempt
 				if failFirst && attempt == 1 {
@@ -79,7 +79,7 @@ func TestTrackerUpdatesMinimumDelay(t *testing.T) {
 			calls := make(chan time.Time, 2)
 			started := time.Now()
 			attempt := 0
-			startTrackerUpdatesWithDelayTest(t, refresh, time.Hour, minDelay, func() (*tracker.TrackerResponse, error) {
+			startTrackerUpdatesWithDelayTest(t, refresh, time.Hour, minDelay, func(context.Context) (*tracker.TrackerResponse, error) {
 				attempt++
 				calls <- time.Now()
 				if failFirst && attempt == 1 {
@@ -106,7 +106,7 @@ func TestTrackerUpdatesMinimumDelay(t *testing.T) {
 
 func TestTrackerUpdatesCancelBeforeInterval(t *testing.T) {
 	calls := make(chan struct{}, 1)
-	cancel, done := startTrackerUpdatesTest(t, time.Hour, func() (*tracker.TrackerResponse, error) {
+	cancel, done := startTrackerUpdatesTest(t, time.Hour, func(context.Context) (*tracker.TrackerResponse, error) {
 		calls <- struct{}{}
 		return &tracker.TrackerResponse{Interval: time.Hour}, nil
 	})
@@ -126,7 +126,7 @@ func TestTrackerUpdatesCancelBeforeInterval(t *testing.T) {
 func TestTrackerUpdatesRetryAfterFailure(t *testing.T) {
 	calls := make(chan int, 4)
 	attempt := 0
-	startTrackerUpdatesTest(t, time.Millisecond, func() (*tracker.TrackerResponse, error) {
+	startTrackerUpdatesTest(t, time.Millisecond, func(context.Context) (*tracker.TrackerResponse, error) {
 		attempt++
 		calls <- attempt
 		if attempt == 1 {
@@ -148,7 +148,7 @@ func TestTrackerUpdatesRetryAfterFailure(t *testing.T) {
 
 func TestTrackerUpdatesUseReturnedInterval(t *testing.T) {
 	calls := make(chan struct{}, 4)
-	startTrackerUpdatesTest(t, time.Millisecond, func() (*tracker.TrackerResponse, error) {
+	startTrackerUpdatesTest(t, time.Millisecond, func(context.Context) (*tracker.TrackerResponse, error) {
 		calls <- struct{}{}
 		return &tracker.TrackerResponse{Interval: time.Hour}, nil
 	})
@@ -161,5 +161,49 @@ func TestTrackerUpdatesUseReturnedInterval(t *testing.T) {
 	case <-calls:
 		t.Error("worker reused the short initial interval instead of the returned hour")
 	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestStopTrackerUpdatesCancelsInFlightAnnounce(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	release := make(chan struct{})
+	stop := startTrackerUpdates(parent, nil, time.Millisecond, 0, func(ctx context.Context) (*tracker.TrackerResponse, error) {
+		close(started)
+		select {
+		case <-ctx.Done():
+		case <-release: // Failure cleanup must also unblock a misrouted context.
+		}
+		close(finished)
+		return nil, ctx.Err()
+	})
+	t.Cleanup(func() {
+		cancel()
+		close(release)
+		stop()
+	})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("tracker worker never entered its announce callback")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		stop()
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("stopping tracker updates did not cancel the in-flight announce")
+	}
+	select {
+	case <-finished:
+	default:
+		t.Error("stop returned before its announce callback finished")
+	}
+	if parent.Err() != nil {
+		t.Error("stopping the tracker worker canceled the parent session")
 	}
 }
