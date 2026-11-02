@@ -120,6 +120,20 @@ go test -race ./... -count=1 -timeout=90s
 go vet ./...
 ```
 
+Bencode fuzz tests check arbitrary input for panics and invalid consumed positions,
+and verify that generated valid nested values decode correctly, including binary
+strings and integer limits. Their seed cases run with ordinary `go test`.
+To generate additional inputs locally:
+
+```sh
+go test ./internal/bencode -run='^$' -fuzz='^FuzzDecode$' -fuzztime=30s -parallel=2 -timeout=90s
+go test ./internal/bencode -run='^$' -fuzz='^FuzzDecodeNestedValues$' -fuzztime=30s -parallel=2 -timeout=90s
+```
+
+GitHub Actions builds, vets, and race-tests the project on pushes and pull
+requests, then runs each fuzz target for ten seconds. These short runs supplement
+the regression tests; they do not prove that all malformed inputs are handled.
+
 Some tests open loopback TCP connections for local fake trackers and peers.
 They do not require public trackers or a real swarm.
 Real-engine TUI tests cover live partial progress, resizing, seeding uploads,
